@@ -3614,7 +3614,7 @@ def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) 
         raw_device_ip = (d.get("device_ip", "") or "").strip()
         ip = _format_ip_for_table((raw_device_ip or raw_recv_ip).strip())
         recv_ip = _format_ip_for_table(raw_recv_ip)
-        rtc_date, rtc_time = _get_cached_device_rtc_display(uid, (raw_device_ip or raw_recv_ip), status)
+        rtc_date, rtc_time = "-", "-"
         dev_ip_raw = (d.get("device_ip", "") or "").strip()
         if dev_ip_raw and raw_recv_ip and dev_ip_raw != raw_recv_ip:
             mismatches.append(short_uid if short_uid else uid)
