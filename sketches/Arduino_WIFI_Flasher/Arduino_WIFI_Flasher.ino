@@ -30,8 +30,8 @@
 #include <SD.h>
 #include <WiFiNINA.h>
 #include <LiquidCrystal.h>
-#include "ESPSerialFlasher.h"
-#include "esp_loader.h"
+#include "src/ESPSerialFlasher/ESPSerialFlasher.h"
+#include "src/ESPSerialFlasher/esp_loader.h"
 
 // AirLift Shield #4285 pin map for Uno R4 WiFi.
 #define AIRLIFT_CS    15   // A1
