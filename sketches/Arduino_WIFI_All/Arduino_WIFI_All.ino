@@ -145,6 +145,7 @@ const char ACK_READY_MESSAGE[] = "ACK_READY";
 uint32_t rtcBaseUnixTs = 0;          // Unix time from last successful RTC read
 uint32_t rtcBaseMs = 0;              // millis() at last successful RTC read
 const uint32_t RTC_REFRESH_INTERVAL_MS = 6000;   // refresh RTC every ~6 seconds
+const uint32_t RTC_REFRESH_MAX_JUMP_SECONDS = 30UL; // reject implausible RTC jumps during cached refresh
 uint32_t rtcFallbackUnixTs = 0;      // startup-derived fallback epoch if RTC read glitches
 const uint8_t RTC_STABLE_READ_MAX = 12;
 const uint16_t RTC_STABLE_READ_DELAY_MS = 80;
@@ -165,9 +166,11 @@ const size_t FILE_CHUNK_SIZE = 4096;
 #endif
 // Mandatory raw-capture period immediately after reboot.
 // Set to 300s for normal time to reach WiFi mode quickly after reboot. 10 for testing
-const uint32_t STARTUP_CAL_CAPTURE_SECONDS = 300UL; // 60UL; // for testing, set to 60s to speed up trim logic testing. Set to 300s for normal use to capture more calibration data and reach WiFi mode faster after reboot.
+const uint32_t STARTUP_CAL_CAPTURE_SECONDS = 600UL; // 60UL; // for testing, set to 60s to speed up trim logic testing. Set to 600s for normal use to capture more calibration data and reach WiFi mode faster after reboot.
 // Duration from file start treated same as calibration section for trim logic.
 const uint32_t TRIM_CALIBRATION_SECONDS = STARTUP_CAL_CAPTURE_SECONDS;
+// Fallback TR file duration when trim threshold calibration fails.
+const uint32_t TRIM_FALLBACK_SECONDS = 60UL;
 // Optional guard from file start before event detection can begin.
 const uint32_t TRIM_START_GUARD_SECONDS = TRIM_CALIBRATION_SECONDS;
 // Seconds of context retained before event trigger time.
@@ -890,6 +893,30 @@ String trimRawFilenameByDatePolicy() {
 }
 
 /***********************
+ * Returns true when a raw DL filename is today's active acquisition file.
+ * @param rawName Filename to test.
+ * @return True when rawName matches myFilename or today's DL filename.
+ ***********************/
+bool isTodayRawFilename(const String &rawName) {
+  if (rawName.length() == 0) return false;
+  if (myFilename.length() > 0 && rawName == myFilename) return true;
+  String todayName = dlFilenameFromEpoch(Get_TimeStamp());
+  return (todayName.length() > 0 && rawName == todayName);
+}
+
+/***********************
+ * Returns true when a TR filename is today's trimmed file.
+ * @param trimName Filename to test.
+ * @return True when trimName matches today's TR filename.
+ ***********************/
+bool isTodayTrimFilename(const String &trimName) {
+  if (trimName.length() == 0) return false;
+  String todayRaw = dlFilenameFromEpoch(Get_TimeStamp());
+  if (todayRaw.length() == 0) return false;
+  return trimName == trimFilenameFromRaw(todayRaw);
+}
+
+/***********************
  * Scans SD root and returns latest DL*.TXT by lexical date token.
  * @return Latest matching filename or empty string.
  ***********************/
@@ -943,14 +970,14 @@ String findLatestTrimmedTrFilename() {
  ***********************/
 String determineReadyUploadFilename() {
   String rawName = trimRawFilenameByDatePolicy();
-  if (rawName.length() == 0 || !SD.exists(rawName.c_str())) rawName = myFilename;
   if (rawName.length() > 0 && SD.exists(rawName.c_str())) {
     String trimName = trimFilenameFromRaw(rawName);
     if (SD.exists(trimName.c_str())) return trimName;
   }
   String latestTr = findLatestTrimmedTrFilename();
-  if (latestTr.length() > 0) return latestTr;
-  return myFilename;
+  if (latestTr.length() > 0 && (TRIM_USE_TODAY_FILENAME || !isTodayTrimFilename(latestTr))) return latestTr;
+  if (TRIM_USE_TODAY_FILENAME && myFilename.length() > 0 && SD.exists(myFilename.c_str())) return myFilename;
+  return "";
 }
 
 /***********************
@@ -1294,6 +1321,67 @@ bool writeTrimmedFileFromIntervals(const String &inputName, const String &output
 }
 
 /***********************
+ * Writes a small fallback trim file when event-threshold calibration fails.
+ * Copies the first TRIM_FALLBACK_SECONDS of parseable raw rows, or all
+ * parseable rows if the file is shorter than that.
+ * @param inputName Source raw filename.
+ * @param outputName Destination trim filename.
+ * @return True when fallback file and ready marker were written.
+ ***********************/
+bool writeTrimFallbackCalibrationOnly(const String &inputName, const String &outputName) {
+  File in = SD.open(inputName.c_str(), FILE_READ);
+  if (!in) return false;
+  String markerName = trimReadyMarkerFilename(outputName);
+  SD.remove(markerName.c_str());
+  SD.remove(outputName.c_str());
+  File out = SD.open(outputName.c_str(), FILE_WRITE);
+  if (!out) {
+    in.close();
+    return false;
+  }
+
+  char line[96];
+  long value = 0;
+  uint32_t ts = 0;
+  uint32_t firstTs = 0;
+  bool haveFirst = false;
+  uint32_t total = 0;
+  uint32_t kept = 0;
+
+  while (readDataLine(in, line, sizeof(line))) {
+    char parse[96];
+    strncpy(parse, line, sizeof(parse) - 1);
+    parse[sizeof(parse) - 1] = '\0';
+    if (!parseDataCsvLine(parse, value, ts)) continue;
+    total++;
+    if (!haveFirst) {
+      haveFirst = true;
+      firstTs = ts;
+    }
+    if (ts > firstTs + TRIM_FALLBACK_SECONDS) break;
+    out.println(line);
+    kept++;
+  }
+
+  out.close();
+  in.close();
+  Serial.print(F("TRIM fallback rows="));
+  Serial.print(total);
+  Serial.print(F(" kept="));
+  Serial.println(kept);
+
+  File marker = SD.open(markerName.c_str(), FILE_WRITE);
+  if (!marker) {
+    Serial.println(F("TRIM fallback fail: marker write"));
+    return false;
+  }
+  marker.print(F("PROBLEM,"));
+  marker.println(kept);
+  marker.close();
+  return true;
+}
+
+/***********************
  * Ensures a TR file exists and is ready before WiFi upload session.
  * If TR exists and non-empty, skip re-trim; otherwise build it.
  * @return True when TR file is ready for transfer.
@@ -1303,20 +1391,16 @@ bool ensureTrimmedFileReadyForWifi() {
 
   String rawName = trimRawFilenameByDatePolicy();
   if (rawName.length() == 0 || !SD.exists(rawName.c_str())) {
-    rawName = myFilename;
-  }
-  if (rawName.length() == 0 || !SD.exists(rawName.c_str())) {
     rawName = findLatestRawDlFilename();
   }
-  if (rawName.length() == 0 || !SD.exists(rawName.c_str())) {
-    Serial.println(F("TRIM skip: no raw DL file found."));
-    return false;
+  if (!TRIM_USE_TODAY_FILENAME && isTodayRawFilename(rawName)) {
+    Serial.print(F("TRIM skip today raw: "));
+    Serial.println(rawName);
+    rawName = "";
   }
-
-  // If TRIM_USE_TODAY_FILENAME is false and we're using today's file, skip trimming
-  if (!TRIM_USE_TODAY_FILENAME && rawName == myFilename) {
-    Serial.println(F("TRIM skip: TRIM_USE_TODAY_FILENAME is false, not trimming today's file."));
-    return true;  // Proceed without trimming
+  if (rawName.length() == 0 || !SD.exists(rawName.c_str())) {
+    Serial.println(F("TRIM skip: no eligible raw DL file found."));
+    return true;
   }
 
   Serial.print(F("TRIM raw target: "));
@@ -1358,8 +1442,14 @@ bool ensureTrimmedFileReadyForWifi() {
   CalibrationThresholds cal = deriveCalibrationThresholdsFromFile(rawName);
   if (!cal.ok) {
     Serial.println(F("TRIM fail: calibration thresholds"));
-    setLcdStatusLine1("Trim: fail cal");
-    return false;
+    Serial.println(F("TRIM fallback: writing calibration-only TR file"));
+    setLcdStatusLine1("Trim: fallback");
+    if (!writeTrimFallbackCalibrationOnly(rawName, trimName)) {
+      Serial.println(F("TRIM fallback fail"));
+      setLcdStatusLine1("Trim: fail fb");
+      return false;
+    }
+    return true;
   }
   Serial.print(F("TRIM thresholds baseline="));
   Serial.print(cal.baselineMean);
@@ -2272,21 +2362,31 @@ uint32_t Get_TimeStamp() {
 
   // Refresh from RTC on first call, or every RTC_REFRESH_INTERVAL_MS
   if (rtcBaseUnixTs == 0 || (nowMs - rtcBaseMs >= RTC_REFRESH_INTERVAL_MS)) {
-
-    // Retry a few times in case I2C is temporarily flaky
-    bool gotRtc = false;
-    for (int i = 0; i < 3; i++) {
-      currenttime = RTC.now();
-
-      // Basic sanity check: reject obviously bad reads
-      if (currenttime.year() >= 2024) {
-        rtcBaseUnixTs = currenttime.unixtime();
-        rtcBaseMs = nowMs;
-        gotRtc = true;
-        break;
+    DateTime stableRtc((uint32_t)0);
+    bool gotRtc = readRtcStable(stableRtc, "timestamp-refresh", 4, 20);
+    if (gotRtc) {
+      uint32_t stableTs = stableRtc.unixtime();
+      bool acceptRefresh = true;
+      if (rtcBaseUnixTs != 0) {
+        uint32_t expectedTs = rtcBaseUnixTs + ((nowMs - rtcBaseMs) / 1000UL);
+        uint32_t jump = (stableTs >= expectedTs) ? (stableTs - expectedTs) : (expectedTs - stableTs);
+        if (jump > RTC_REFRESH_MAX_JUMP_SECONDS) {
+          acceptRefresh = false;
+          Serial.print(F("RTC refresh rejected: jump="));
+          Serial.print(jump);
+          Serial.print(F(" expected="));
+          Serial.print((unsigned long)expectedTs);
+          Serial.print(F(" rtc="));
+          Serial.println((unsigned long)stableTs);
+        }
       }
-
-      delay(5);
+      if (acceptRefresh) {
+        rtcBaseUnixTs = stableTs;
+        rtcBaseMs = nowMs;
+        rtcFallbackUnixTs = rtcBaseUnixTs;
+      } else {
+        gotRtc = false;
+      }
     }
 
     // If first read attempts fail and cache is still empty, return a safe
