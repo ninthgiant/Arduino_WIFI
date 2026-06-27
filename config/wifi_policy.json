@@ -1,0 +1,5 @@
+{
+  "grace_min": 60,
+  "policy": "STAY_ACTIVE",
+  "wake_hour": 16
+}

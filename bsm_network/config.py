@@ -31,6 +31,7 @@ DEFAULT_DB_PATH = "data/bsm_network.db"
 DEFAULT_NETWORK_MAP = ""
 DEFAULT_RUNTIME_AP_MAP = ""
 DEFAULT_PROFILE_PATH = "config/network_profile.json"
+DEFAULT_WIFI_POLICY_PATH = "config/wifi_policy.json"
 ACTIVE_NETWORK_PROFILE = "builtin"
 ACTIVE_NETWORK_PROFILE_SOURCE = "builtin defaults"
 
@@ -322,6 +323,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--mark-partial-received",
         action="store_true",
         help="Treat partial transfers as received so they are not retried (only used with --transfer-tolerant)",
+    )
+    parser.add_argument(
+        "--wifi-policy-path",
+        default=DEFAULT_WIFI_POLICY_PATH,
+        help=f"JSON file containing Arduino WiFi policy (default: {DEFAULT_WIFI_POLICY_PATH})",
+    )
+    parser.add_argument(
+        "--apply-wifi-policy",
+        action="store_true",
+        default=True,
+        help="Send configured WiFi policy to discovered Arduinos (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-apply-wifi-policy",
+        action="store_false",
+        dest="apply_wifi_policy",
+        help="Do not send WiFi policy commands to Arduinos.",
     )
     parser.add_argument("--scheduled", action="store_true", help="Run discover/transfer in a repeating time-window loop (opt-in)")
     parser.add_argument("--no-scheduled", action="store_false", dest="scheduled", help="Disable scheduled mode")

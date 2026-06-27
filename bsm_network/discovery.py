@@ -29,7 +29,8 @@ from .db import (
     self_test_db_writes,
     upsert_device,
 )
-from .protocol import parse_payload, request_remote_file_list, send_time_sync, transfer_file_protocol
+from .protocol import parse_payload, request_remote_file_list, send_time_sync, set_wifi_policy, transfer_file_protocol
+from .wifi_policy import build_wifi_policy_command, load_wifi_policy
 from .records import (
     build_local_filename,
     ensure_unique_filename,
@@ -182,6 +183,51 @@ def parse_ready_to_upload(payload: str) -> dict[str, str] | None:
         "size": size,
         "unix_ts": ts,
     }
+
+
+def _firmware_supports_wifi_policy(version: str) -> bool:
+    """Return whether Arduino firmware is expected to support SET_WIFI_POLICY."""
+    match = re.match(r"\s*(\d+)\.(\d+)", version or "")
+    if not match:
+        return False
+    major = int(match.group(1))
+    minor = int(match.group(2))
+    return (major, minor) >= (4, 2)
+
+
+def _apply_wifi_policy_to_rows(
+    args: argparse.Namespace,
+    sock: socket.socket,
+    rows: list[dict[str, str | int]],
+) -> None:
+    """Send configured WiFi policy to firmware that supports it."""
+    if not bool(getattr(args, "apply_wifi_policy", True)):
+        return
+    wifi_policy = load_wifi_policy(str(getattr(args, "wifi_policy_path", "")))
+    wifi_policy_command = build_wifi_policy_command(wifi_policy)
+    print(f"WiFi policy command: {wifi_policy_command}")
+    for row in rows:
+        uid = str(row.get("unique_id", ""))
+        firmware_version = str(row.get("firmware_version", ""))
+        if not _firmware_supports_wifi_policy(firmware_version):
+            print(f"{uid}: WiFi policy skipped (firmware={firmware_version or 'unknown'})")
+            continue
+        device_ip = str(row["device_ip"] or row["recv_ip"])
+        try:
+            ok = set_wifi_policy(
+                control_sock=sock,
+                device_ip=device_ip,
+                control_port=args.discover_port,
+                command=wifi_policy_command,
+                timeout_s=3.0,
+            )
+        except Exception as exc:
+            ok = False
+            print(f"{uid}: WiFi policy failed: {exc}")
+        if ok:
+            print(f"{uid}: WiFi policy accepted")
+        else:
+            print(f"{uid}: WiFi policy not accepted")
 
 
 def request_network_uid(
@@ -1061,6 +1107,7 @@ def run_discovery(args: argparse.Namespace) -> int:
                 print(f"{uid}: RTC sync failed/timeout")
 
         print(f"RTC sync-only summary: ok={ok_count}, failed={fail_count}")
+        _apply_wifi_policy_to_rows(args=args, sock=sock, rows=rows)
         sock.close()
         return 0 if fail_count == 0 else 1
 
@@ -1286,5 +1333,6 @@ def run_discovery(args: argparse.Namespace) -> int:
             else:
                 print(f"{uid}: RTC end-cycle sync failed/timeout")
 
+    _apply_wifi_policy_to_rows(args=args, sock=sock, rows=rows)
     sock.close()
     return 0

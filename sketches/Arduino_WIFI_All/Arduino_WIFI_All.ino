@@ -106,6 +106,9 @@ bool wifiLowPowerStandby = false;
 uint32_t wifiLastActivityTs = 0;
 uint32_t wifiNextStandbyProbeTs = 0;
 bool wifiCommandHandled = false;
+uint8_t wifiPolicy = 0;
+uint16_t wifiPolicyGraceMinutes = 60;
+uint8_t wifiPolicyWakeHour = 16;
 bool readyBeaconAcked = false;
 bool uploadCompletedThisWindow = false;
 uint32_t nextReadyBeaconMs = 0;
@@ -140,6 +143,8 @@ const char GET_LOGS_MESSAGE[] = "GET_LOGS";
 const char CLEAR_ERRORS_MESSAGE[] = "CLEAR_ERRORS";
 const char READY_TO_UPLOAD_MESSAGE[] = "READY_TO_UPLOAD";
 const char ACK_READY_MESSAGE[] = "ACK_READY";
+const char SET_WIFI_POLICY_MESSAGE[] = "SET_WIFI_POLICY";
+const char GET_WIFI_POLICY_MESSAGE[] = "GET_WIFI_POLICY";
 
 // Cached time support. RTC/Gateway establish the base; millis() advances it.
 uint32_t rtcBaseUnixTs = 0;          // Trusted Unix time at rtcBaseMs
@@ -189,14 +194,12 @@ const int MAX_TRIM_INTERVALS = 128;
 // Require this many seconds continuously outside the WiFi window before leaving WiFi mode.
 const uint32_t WIFI_EXIT_DEBOUNCE_SECONDS = 120UL;
 // WiFi-window low-power behavior.
-// After idle timeout in active WiFi mode, drop to standby and wake periodically.
+// Policy STAY_ACTIVE preserves existing behavior. Policy MORNING_ONLY can drop
+// WiFi after READY/upload work and wake again at the configured hour.
 const bool WIFI_STANDBY_ENABLED = true;
-// Runtime policy gate: keep standby code compiled but disabled in normal flow.
-// Set true in future versions to re-enable standby transitions.
-const bool WIFI_STANDBY_POLICY_ACTIVE = false;
-const uint32_t WIFI_MAINTENANCE_IDLE_SECONDS = 15UL * 60UL;
+const uint8_t WIFI_POLICY_STAY_ACTIVE = 0;
+const uint8_t WIFI_POLICY_MORNING_ONLY = 1;
 const uint32_t WIFI_STANDBY_CHECK_INTERVAL_SECONDS = 30UL;
-const uint32_t WIFI_STANDBY_LISTEN_SECONDS = 8UL;
 const uint32_t READY_BEACON_INTERVAL_MS = 45000UL;
 const uint32_t READY_BEACON_JITTER_MS = 10000UL;
 // Raw file selection policy for trim phase.
@@ -237,13 +240,13 @@ const bool debug = false;
 const bool countdown = true;
 // show which build we are making
 #if defined(WIFI_PROFILE_AIRLIFT) && BSM_SENSOR_HOOK_ENABLED
-const char VERSION[] = "4.1ctd";
+const char VERSION[] = "4.2ctd";
 #elif defined(WIFI_PROFILE_AIRLIFT)
-const char VERSION[] = "4.1ctp";
+const char VERSION[] = "4.2ctp";
 #elif defined(WIFI_PROFILE_R4_WIFI) && BSM_SENSOR_HOOK_ENABLED
-const char VERSION[] = "4.1cwd";
+const char VERSION[] = "4.2cwd";
 #else
-const char VERSION[] = "4.1cwp";
+const char VERSION[] = "4.2cwp";
 #endif
 
 
@@ -300,6 +303,32 @@ String getChipIdHex() {
 
 String getFirmwareVersion() {
   return String(VERSION);
+}
+
+String wifiPolicyName() {
+  if (wifiPolicy == WIFI_POLICY_MORNING_ONLY) return "MORNING_ONLY";
+  return "STAY_ACTIVE";
+}
+
+uint8_t parseWifiPolicyName(const char *value) {
+  if (value == nullptr) return WIFI_POLICY_STAY_ACTIVE;
+  if (strcmp(value, "MORNING_ONLY") == 0) return WIFI_POLICY_MORNING_ONLY;
+  return WIFI_POLICY_STAY_ACTIVE;
+}
+
+bool wifiPolicyMaySleep() {
+  return WIFI_STANDBY_ENABLED
+    && wifiPolicy == WIFI_POLICY_MORNING_ONLY
+    && (readyBeaconAcked || uploadCompletedThisWindow);
+}
+
+bool wifiPolicyWakeTimeReached(uint32_t unixTs) {
+  uint32_t hour = (unixTs % 86400UL) / 3600UL;
+  return hour >= wifiPolicyWakeHour;
+}
+
+uint32_t wifiPolicyGraceSeconds() {
+  return (uint32_t)wifiPolicyGraceMinutes * 60UL;
 }
 
 /***********************
@@ -2074,6 +2103,14 @@ void serviceWifiCommands() {
     return;
   }
 
+  if (strcmp(incoming, GET_WIFI_POLICY_MESSAGE) == 0) {
+    String response = String("WIFI_POLICY,POLICY=") + wifiPolicyName()
+      + ",GRACE_MIN=" + String(wifiPolicyGraceMinutes)
+      + ",WAKE_HOUR=" + String(wifiPolicyWakeHour);
+    sendUdpMessage(response, remoteIp, remotePort);
+    return;
+  }
+
   if (strcmp(incoming, GET_TIME_MESSAGE) == 0) {
     DateTime nowRtc((uint32_t)0);
     bool ok = false;
@@ -2110,8 +2147,8 @@ void serviceWifiCommands() {
   char parseBuf[192];
   strncpy(parseBuf, incoming, sizeof(parseBuf) - 1);
   parseBuf[sizeof(parseBuf) - 1] = '\0';
-  char *fields[6] = {nullptr};
-  int fieldCount = splitCsv(parseBuf, fields, 6);
+  char *fields[8] = {nullptr};
+  int fieldCount = splitCsv(parseBuf, fields, 8);
 
   if (fieldCount >= 3 && strcmp(fields[0], ACK_READY_MESSAGE) == 0) {
     String ackUid = String(fields[1]);
@@ -2125,6 +2162,42 @@ void serviceWifiCommands() {
       Serial.print(F("READY ACK received for "));
       Serial.println(readyUploadFilename);
     }
+    return;
+  }
+
+  if (fieldCount >= 2 && strcmp(fields[0], SET_WIFI_POLICY_MESSAGE) == 0) {
+    uint8_t newPolicy = parseWifiPolicyName(fields[1]);
+    uint16_t newGraceMin = wifiPolicyGraceMinutes;
+    uint8_t newWakeHour = wifiPolicyWakeHour;
+    for (int i = 2; i < fieldCount; ++i) {
+      char *param = fields[i];
+      char *eq = strchr(param, '=');
+      if (!eq) continue;
+      *eq = '\0';
+      char *key = param;
+      char *value = eq + 1;
+      if (strcmp(key, "GRACE_MIN") == 0) {
+        int val = atoi(value);
+        if (val >= 0 && val <= 360) newGraceMin = (uint16_t)val;
+      } else if (strcmp(key, "WAKE_HOUR") == 0) {
+        int val = atoi(value);
+        if (val >= 0 && val < 24) newWakeHour = (uint8_t)val;
+      }
+    }
+    wifiPolicy = newPolicy;
+    wifiPolicyGraceMinutes = newGraceMin;
+    wifiPolicyWakeHour = newWakeHour;
+    wifiLastActivityTs = Get_TimeStamp();
+    String response = String("ACK_WIFI_POLICY,POLICY=") + wifiPolicyName()
+      + ",GRACE_MIN=" + String(wifiPolicyGraceMinutes)
+      + ",WAKE_HOUR=" + String(wifiPolicyWakeHour);
+    sendUdpMessage(response, remoteIp, remotePort);
+    Serial.print(F("WiFi policy set: "));
+    Serial.print(wifiPolicyName());
+    Serial.print(F(" grace_min="));
+    Serial.print(wifiPolicyGraceMinutes);
+    Serial.print(F(" wake_hour="));
+    Serial.println(wifiPolicyWakeHour);
     return;
   }
 
@@ -2207,14 +2280,25 @@ void serviceWifiCommands() {
     String mode = wifiModeActive ? "WIFI" : (wifiLowPowerStandby ? "WIFI_STBY" : "DATA");
     uint32_t sdFree = 0; // TODO: SD.totalBytes() may not be available in all libraries
     uint32_t lastTs = Get_TimeStamp();
-    String response = "STATUS,UPTIME=" + String(uptime) + ",MODE=" + mode + ",SD_FREE_KB=" + String(sdFree) + ",LAST_DATA_TS=" + String(lastTs) + ",BATTERY=N/A";
+    String response = String("STATUS,UPTIME=") + String(uptime)
+      + ",MODE=" + mode
+      + ",WIFI_POLICY=" + wifiPolicyName()
+      + ",WIFI_SLEEPING=" + String(wifiLowPowerStandby ? 1 : 0)
+      + ",SD_FREE_KB=" + String(sdFree)
+      + ",LAST_DATA_TS=" + String(lastTs)
+      + ",BATTERY=N/A";
     sendUdpMessage(response, remoteIp, remotePort);
     return;
   }
 
   // GET_CONFIG: Report current configuration (hours, device ID)
   if (strcmp(incoming, GET_CONFIG_MESSAGE) == 0) {
-    String response = "CONFIG,START_HOUR=" + String(START_HOUR) + ",END_HOUR=" + String(END_HOUR) + ",DEVICE_ID=" + deviceId;
+    String response = String("CONFIG,START_HOUR=") + String(START_HOUR)
+      + ",END_HOUR=" + String(END_HOUR)
+      + ",WIFI_POLICY=" + wifiPolicyName()
+      + ",GRACE_MIN=" + String(wifiPolicyGraceMinutes)
+      + ",WAKE_HOUR=" + String(wifiPolicyWakeHour)
+      + ",DEVICE_ID=" + deviceId;
     sendUdpMessage(response, remoteIp, remotePort);
     return;
   }
@@ -2236,7 +2320,10 @@ void serviceWifiCommands() {
     } else {
       response += ",CACHE_RTC_DELTA_SEC=NA";
     }
-    response += ",RTC_ERRORS=" + String(rtcErrorCount)
+    response += ",WIFI_POLICY=" + wifiPolicyName()
+      + ",WIFI_LAST_ACTIVITY=" + String((unsigned long)wifiLastActivityTs)
+      + ",WIFI_NEXT_PROBE=" + String((unsigned long)wifiNextStandbyProbeTs)
+      + ",RTC_ERRORS=" + String(rtcErrorCount)
       + ",I2C_ERRORS=" + String(i2cErrorCount)
       + ",SD_ERRORS=" + String(sdErrorCount);
     sendUdpMessage(response, remoteIp, remotePort);
@@ -2878,12 +2965,12 @@ void loop() {
       serviceWifiCommands();
       if (wifiCommandHandled) wifiLastActivityTs = unixTs;
       maybeSendReadyToUploadBeacon();
-      if (WIFI_STANDBY_ENABLED && WIFI_STANDBY_POLICY_ACTIVE && wifiLastActivityTs > 0 && unixTs >= (wifiLastActivityTs + WIFI_MAINTENANCE_IDLE_SECONDS)) {
-        Serial.println(F("WiFi idle timeout -> standby"));
+      if (wifiPolicyMaySleep() && wifiLastActivityTs > 0 && unixTs >= (wifiLastActivityTs + wifiPolicyGraceSeconds()) && !wifiPolicyWakeTimeReached(unixTs)) {
+        Serial.println(F("WiFi policy idle timeout -> standby"));
         exitWifiMode();
         wifiModeActive = false;
         wifiLowPowerStandby = true;
-        wifiNextStandbyProbeTs = unixTs + WIFI_STANDBY_CHECK_INTERVAL_SECONDS;
+        wifiNextStandbyProbeTs = ((unixTs / 86400UL) * 86400UL) + ((uint32_t)wifiPolicyWakeHour * 3600UL);
         if (printLCD) setLcdStatusLine1("WiFi: standby");
       }
     }
@@ -2903,12 +2990,12 @@ void loop() {
       return;
     }
 
-    if (wifiLowPowerStandby && WIFI_STANDBY_ENABLED && WIFI_STANDBY_POLICY_ACTIVE) {
-      if (unixTs < wifiNextStandbyProbeTs) {
+    if (wifiLowPowerStandby && wifiPolicy == WIFI_POLICY_MORNING_ONLY) {
+      if (!wifiPolicyWakeTimeReached(unixTs)) {
         delay(250);
         return;
       }
-      Serial.println(F("WiFi standby probe"));
+      Serial.println(F("WiFi policy wake hour reached"));
       enterWifiMode();
       wifiModeActive = wifiInitialized;
       if (!wifiModeActive) {
@@ -2916,28 +3003,10 @@ void loop() {
         delay(250);
         return;
       }
-      uint32_t listenUntil = unixTs + WIFI_STANDBY_LISTEN_SECONDS;
-      bool promoted = false;
-      while (Get_TimeStamp() < listenUntil) {
-        serviceWifiCommands();
-        if (wifiCommandHandled) {
-          promoted = true;
-          wifiLastActivityTs = Get_TimeStamp();
-          break;
-        }
-        delay(50);
-      }
-      if (promoted) {
-        Serial.println(F("WiFi standby wake -> active"));
-        wifiLowPowerStandby = false;
-        wifiOutWindowSinceTs = 0;
-      } else {
-        exitWifiMode();
-        wifiModeActive = false;
-        wifiLowPowerStandby = true;
-        wifiNextStandbyProbeTs = Get_TimeStamp() + WIFI_STANDBY_CHECK_INTERVAL_SECONDS;
-        if (printLCD) setLcdStatusLine1("WiFi: standby");
-      }
+      Serial.println(F("WiFi standby wake -> active"));
+      wifiLowPowerStandby = false;
+      wifiOutWindowSinceTs = 0;
+      wifiLastActivityTs = unixTs;
       return;
     }
 

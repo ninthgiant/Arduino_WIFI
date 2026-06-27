@@ -390,6 +390,31 @@ def set_device_config(
     return False
 
 
+def set_wifi_policy(
+    control_sock: socket.socket,
+    device_ip: str,
+    control_port: int,
+    command: str,
+    timeout_s: float = 3.0,
+) -> bool:
+    """Send SET_WIFI_POLICY to an Arduino and return whether it was accepted."""
+    control_sock.sendto(command.encode("utf-8"), (device_ip, control_port))
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            data, (src_ip, _) = control_sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+        if src_ip != device_ip:
+            continue
+        line = data.decode("utf-8", errors="replace").strip()
+        if line.startswith("ACK_WIFI_POLICY"):
+            return True
+        if line.startswith("ERR_WIFI_POLICY"):
+            return False
+    return False
+
+
 def reboot_device(
     control_sock: socket.socket,
     device_ip: str,

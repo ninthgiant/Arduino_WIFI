@@ -69,9 +69,19 @@ from bsm_network.protocol import (
     ping_device as protocol_ping_device,
     reboot_device as protocol_reboot_device,
     set_device_config as protocol_set_device_config,
+    set_wifi_policy as protocol_set_wifi_policy,
     transfer_file_protocol,
 )
 from bsm_network.records import build_local_filename, ensure_unique_filename
+from bsm_network.wifi_policy import (
+    DEFAULT_WIFI_POLICY_PATH,
+    POLICY_MORNING_ONLY,
+    POLICY_STAY_ACTIVE,
+    build_wifi_policy_command,
+    load_wifi_policy,
+    normalize_wifi_policy,
+    save_wifi_policy,
+)
 from bsm_web_ui.components import (
     PageContext,
     _render_action_form,
@@ -95,7 +105,7 @@ UI_STATE_LOCK = threading.Lock()
 LAST_SET_TIME_OFFSET_HOURS = WEB_SET_TIME_OFFSET_HOURS
 LAST_SET_TIME_PRESET = "ast"
 WEB_APP_NAME = "NORTH_END_IOT"
-WEB_APP_VERSION = "4.4"
+WEB_APP_VERSION = "4.5"
 WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
 UI_POLL_UPLOADS_MS = 5000
 UI_POLL_DEVICES_MS = 5000
@@ -1002,6 +1012,29 @@ def set_device_config(device_ip: str, config_updates: dict[str, str], timeout_s:
         return f"SET_CONFIG failed/timeout from {device_ip}"
     except Exception as exc:  # noqa: BLE001
         return f"SET_CONFIG failed for {device_ip}: {exc}"
+    finally:
+        sock.close()
+
+
+def set_device_wifi_policy(device_ip: str, policy: dict[str, object], timeout_s: float = 3.0) -> str:
+    """Send current Gateway WiFi policy to one Arduino."""
+    clean = normalize_wifi_policy(policy)
+    command = build_wifi_policy_command(clean)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(timeout_s)
+        ok = protocol_set_wifi_policy(
+            control_sock=sock,
+            device_ip=device_ip,
+            control_port=DISCOVER_CONTROL_PORT,
+            command=command,
+            timeout_s=timeout_s,
+        )
+        if ok:
+            return f"SET_WIFI_POLICY OK for {device_ip}: {command}"
+        return f"SET_WIFI_POLICY failed/timeout from {device_ip}: {command}"
+    except Exception as exc:  # noqa: BLE001
+        return f"SET_WIFI_POLICY failed for {device_ip}: {exc}"
     finally:
         sock.close()
 
@@ -3919,14 +3952,14 @@ def _maintenance_panel_data(device_ip: str) -> dict[str, tuple[str, str, str]]:
     status = _dict_panel_lines(
         fetch_fn=protocol_get_device_status,
         device_ip=device_ip,
-        fallback_order=["UPTIME", "MODE", "SD_FREE_KB", "LAST_DATA_TS", "BATTERY"],
+        fallback_order=["UPTIME", "MODE", "WIFI_POLICY", "WIFI_SLEEPING", "SD_FREE_KB", "LAST_DATA_TS", "BATTERY"],
         timeout_s=MAINTENANCE_PANEL_TIMEOUT_S,
     )
     time.sleep(MAINTENANCE_PANEL_GAP_S)
     config = _dict_panel_lines(
         fetch_fn=protocol_get_device_config,
         device_ip=device_ip,
-        fallback_order=["START_HOUR", "END_HOUR", "DEVICE_ID"],
+        fallback_order=["START_HOUR", "END_HOUR", "WIFI_POLICY", "GRACE_MIN", "WAKE_HOUR", "DEVICE_ID"],
         timeout_s=MAINTENANCE_PANEL_TIMEOUT_S,
     )
     time.sleep(MAINTENANCE_PANEL_GAP_S)
@@ -3940,6 +3973,9 @@ def _maintenance_panel_data(device_ip: str) -> dict[str, tuple[str, str, str]]:
             "CACHE_SOURCE",
             "CACHE_AGE_SEC",
             "CACHE_RTC_DELTA_SEC",
+            "WIFI_POLICY",
+            "WIFI_LAST_ACTIVITY",
+            "WIFI_NEXT_PROBE",
             "RTC_ERRORS",
             "I2C_ERRORS",
             "SD_ERRORS",
@@ -4022,6 +4058,19 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
         f'<option value="{html.escape(value)}"{" selected" if tz_selected == value else ""}>{html.escape(label)}</option>'
         for value, label in tz_options
     )
+    wifi_policy = load_wifi_policy(DEFAULT_WIFI_POLICY_PATH)
+    wifi_policy = normalize_wifi_policy(wifi_policy)
+    policy_mode = str(wifi_policy["policy"])
+    policy_grace_min = str(wifi_policy["grace_min"])
+    policy_wake_hour = str(wifi_policy["wake_hour"])
+    policy_options = [
+        (POLICY_STAY_ACTIVE, "Stay active"),
+        (POLICY_MORNING_ONLY, "Morning only"),
+    ]
+    policy_options_html = "\n".join(
+        f'<option value="{html.escape(value)}"{" selected" if policy_mode == value else ""}>{html.escape(label)}</option>'
+        for value, label in policy_options
+    )
 
     extra_css = """
     .device-head, .device-sep { white-space: pre; }
@@ -4033,6 +4082,9 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
     .mini-box { border: 1px solid var(--line); background: #fbfdff; border-radius: 6px; height: 88px; overflow: auto; padding: 0.55rem; white-space: pre; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.84rem; line-height: 1.3; }
     .set-rtc-inline { display:flex; align-items:center; gap:0.45rem; flex-wrap:wrap; }
     .set-rtc-inline select { padding:0.45rem; border:1px solid #9cb2c9; border-radius:4px; background:#fff; color:#1f2937; font-size:0.92rem; }
+    .policy-inline { display:flex; align-items:center; gap:0.45rem; flex-wrap:wrap; margin-top:0.7rem; }
+    .policy-inline select, .policy-inline input { padding:0.45rem; border:1px solid #9cb2c9; border-radius:4px; background:#fff; color:#1f2937; font-size:0.92rem; }
+    .policy-inline input { width:4.8rem; }
     @media (max-width: 900px) { .mini-grid { grid-template-columns: 1fr; } }
     """
     body_html = f"""
@@ -4055,6 +4107,18 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
           <button type="submit" name="mode" value="edit" class="needs-device">Edit Burrow_ID</button>
           <button type="submit" name="mode" value="save" class="needs-device">Save Burrow_ID</button>
         </div>
+      </form>
+
+      <form method="post" action="/maintenance-wifi-policy" class="policy-inline">
+        <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
+        <label for="wifi_policy">WiFi Policy:</label>
+        <select id="wifi_policy" name="policy">{policy_options_html}</select>
+        <label for="policy_grace_min">Grace min:</label>
+        <input id="policy_grace_min" name="grace_min" type="number" min="0" max="360" value="{html.escape(policy_grace_min)}" />
+        <label for="policy_wake_hour">Wake hour:</label>
+        <input id="policy_wake_hour" name="wake_hour" type="number" min="0" max="23" value="{html.escape(policy_wake_hour)}" />
+        <button type="submit" name="mode" value="save">Save Gateway Policy</button>
+        <button type="submit" name="mode" value="apply" class="needs-device">Apply to Selected</button>
       </form>
 
       {_render_controls_row([
@@ -4695,6 +4759,37 @@ class Handler(BaseHTTPRequestHandler):
             msg = assign_burrow_id_for_uid(unique_id=selected_uid, burrow_id=burrow_id)
             append_action_log("maintenance-save-burrow", msg)
             self._send_html(render_maintenance_page(message=msg, selected_uid=selected_uid, burrow_input=burrow_id))
+            return True
+        if self.path == "/maintenance-wifi-policy":
+            selected_uid = (form.get("uid") or [""])[0].strip()
+            mode = (form.get("mode") or ["save"])[0].strip().lower()
+            policy = {
+                "policy": (form.get("policy") or [POLICY_STAY_ACTIVE])[0],
+                "grace_min": (form.get("grace_min") or ["60"])[0],
+                "wake_hour": (form.get("wake_hour") or ["16"])[0],
+            }
+            clean = save_wifi_policy(policy, DEFAULT_WIFI_POLICY_PATH)
+            msg = (
+                f"Saved Gateway WiFi policy: {clean['policy']} "
+                f"grace_min={clean['grace_min']} wake_hour={clean['wake_hour']}."
+            )
+            if mode == "apply":
+                if not selected_uid:
+                    self._send_html(render_maintenance_page(message="Select a known Arduino first.", selected_uid=selected_uid))
+                    return True
+                devices = read_devices_rows(Path("data/discovered_devices.csv"))
+                selected_device = _find_device_by_uid(devices, selected_uid)
+                if selected_device is None:
+                    self._send_html(render_maintenance_page(message="Invalid device selection.", selected_uid=selected_uid))
+                    return True
+                device_ip = (selected_device.get("device_ip") or selected_device.get("recv_ip") or "").strip()
+                if not device_ip:
+                    self._send_html(render_maintenance_page(message="Selected Arduino has no IP address.", selected_uid=selected_uid))
+                    return True
+                apply_msg = set_device_wifi_policy(device_ip=device_ip, policy=clean)
+                msg = f"{msg} {apply_msg}"
+            append_action_log("maintenance-wifi-policy", msg)
+            self._send_html(render_maintenance_page(message=msg, selected_uid=selected_uid))
             return True
         return False
 
