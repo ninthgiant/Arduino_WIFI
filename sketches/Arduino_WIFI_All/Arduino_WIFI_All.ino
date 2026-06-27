@@ -154,7 +154,7 @@ const uint16_t RTC_NTP_RETRY_DELAY_MS = 500;
 const long RTC_NTP_LOCAL_OFFSET_SECONDS = -3L * 3600L;  // Align with controller local offset (UTC-3h).
 
 // Time window for WiFi phase (hours in local controller time). Default will be 7 and 19. Currently changed for testing during the day
-uint8_t START_HOUR = 7;
+uint8_t START_HOUR = 7;    // testing using 1 hr window. Return to 7 to 19 for deployment
 uint8_t END_HOUR = 19;
 // TCP chunk size used for file transfer to controller.
 // WiFiNINA/AirLift is more reliable with smaller chunks; R4 WiFi can use larger chunks.
