@@ -72,7 +72,7 @@ python3 bsm_network.py --cloud-once
 - `--no-discover`: Disable discovery workflow.
 - `--discover-ip DISCOVER_IP`: Broadcast IP used for discovery poll. Default: `192.168.10.255`.
 - `--discover-port DISCOVER_PORT`: Arduino UDP control port. Default: `8888`.
-- `--discover-timeout DISCOVER_TIMEOUT`: Seconds to wait for discovery replies. Default: `30.0`.
+- `--discover-timeout DISCOVER_TIMEOUT`: Seconds to wait for discovery replies or READY beacons. Default: `70.0`, long enough to overlap the Arduino `READY_TO_UPLOAD` beacon interval plus jitter.
 - `--discover-attempts DISCOVER_ATTEMPTS`: Number of poll broadcasts. Default: `15`.
 - `--discover-interval DISCOVER_INTERVAL`: Seconds between poll broadcasts. Default: `0.6`.
 - `--discover-csv DISCOVER_CSV`: Output CSV path for discovered device table.

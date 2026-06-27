@@ -26,6 +26,7 @@ DEFAULT_WEB_PORT = 5001
 DEFAULT_AP_ID = "DEFAULT"
 DEFAULT_AP_LIMIT = 2
 DEFAULT_MAX_CONCURRENT_TRANSFERS = 0
+DEFAULT_DISCOVER_TIMEOUT = 70.0
 DEFAULT_DB_PATH = "data/bsm_network.db"
 DEFAULT_NETWORK_MAP = ""
 DEFAULT_RUNTIME_AP_MAP = ""
@@ -205,7 +206,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--discover-ip", default=DEFAULT_DISCOVER_BROADCAST_IP, help=f"Broadcast IP for discovery polls (default: {DEFAULT_DISCOVER_BROADCAST_IP})")
     parser.add_argument("--discover-port", type=int, default=DEFAULT_DISCOVER_PORT, help=f"UDP port Arduino listens on for discovery polls (default: {DEFAULT_DISCOVER_PORT})")
-    parser.add_argument("--discover-timeout", type=float, default=30.0, help="Seconds to wait for discovery replies (default: 30.0)")
+    parser.add_argument("--discover-timeout", type=float, default=DEFAULT_DISCOVER_TIMEOUT, help=f"Seconds to wait for discovery replies (default: {DEFAULT_DISCOVER_TIMEOUT})")
     parser.add_argument("--discover-attempts", type=int, default=15, help="How many poll broadcasts to send (default: 15)")
     parser.add_argument("--discover-interval", type=float, default=0.6, help="Seconds between poll broadcasts (default: 0.6)")
     parser.add_argument("--discover-csv", default="", help="Optional CSV path to write discovered device table")
