@@ -766,23 +766,29 @@ def sort_device_rows(rows: list[dict[str, str]], sort_mode: str) -> list[dict[st
         short_uid = (row.get("short_uid", "") or "").strip()
         return short_uid or (uid[-6:] if len(uid) >= 6 else uid)
 
+    def burrow_value(row: dict[str, str]) -> str:
+        return (row.get("burrow_id", "") or "").strip().lower()
+
+    def unique_value(row: dict[str, str]) -> str:
+        return (row.get("unique_id", "") or "").strip().lower()
+
     if mode == "burrow_id":
         return sorted(
             rows,
             key=lambda r: (
                 1 if not (r.get("burrow_id", "") or "").strip() else 0,
-                (r.get("burrow_id", "") or "").strip().lower(),
-                short_uid_value(r).lower(),
+                burrow_value(r),
+                unique_value(r),
             ),
         )
     if mode == "short_uid":
-        return sorted(rows, key=lambda r: (short_uid_value(r).lower(), (r.get("burrow_id", "") or "").strip().lower()))
+        return sorted(rows, key=lambda r: (short_uid_value(r).lower(), burrow_value(r), unique_value(r)))
 
-    return sorted(
-        rows,
-        key=lambda r: _iso_to_dt((r.get("last_seen", "") or "").strip()) or dt.datetime.min,
-        reverse=True,
-    )
+    def last_seen_sort_value(row: dict[str, str]) -> float:
+        seen = _iso_to_dt((row.get("last_seen", "") or "").strip())
+        return seen.timestamp() if seen is not None else 0.0
+
+    return sorted(rows, key=lambda r: (-last_seen_sort_value(r), burrow_value(r), unique_value(r)))
 
 
 def read_devices_status(path: Path, online_seconds: int = 600, sort_mode: str = "last_seen") -> str:
