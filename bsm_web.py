@@ -3855,7 +3855,11 @@ def _maintenance_info_lines(device_ip: str) -> list[str]:
     return lines
 
 
-def _rtc_panel_lines(device_ip: str, timeout_s: float = 2.0) -> tuple[str, str, str]:
+MAINTENANCE_PANEL_TIMEOUT_S = 5.0
+MAINTENANCE_PANEL_GAP_S = 0.15
+
+
+def _rtc_panel_lines(device_ip: str, timeout_s: float = MAINTENANCE_PANEL_TIMEOUT_S) -> tuple[str, str, str]:
     """Build two-line RTC panel text (header/separator/value)."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -3883,7 +3887,7 @@ def _dict_panel_lines(
     fetch_fn,
     device_ip: str,
     fallback_order: list[str],
-    timeout_s: float = 2.0,
+    timeout_s: float = MAINTENANCE_PANEL_TIMEOUT_S,
 ) -> tuple[str, str, str]:
     """Query a maintenance payload and render fixed-width header/value rows."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -3911,18 +3915,21 @@ def _dict_panel_lines(
 def _maintenance_panel_data(device_ip: str) -> dict[str, tuple[str, str, str]]:
     """Fetch all maintenance mini-panel payloads for one device."""
     rtc = _rtc_panel_lines(device_ip=device_ip)
+    time.sleep(MAINTENANCE_PANEL_GAP_S)
     status = _dict_panel_lines(
         fetch_fn=protocol_get_device_status,
         device_ip=device_ip,
         fallback_order=["UPTIME", "MODE", "SD_FREE_KB", "LAST_DATA_TS", "BATTERY"],
-        timeout_s=2.0,
+        timeout_s=MAINTENANCE_PANEL_TIMEOUT_S,
     )
+    time.sleep(MAINTENANCE_PANEL_GAP_S)
     config = _dict_panel_lines(
         fetch_fn=protocol_get_device_config,
         device_ip=device_ip,
         fallback_order=["START_HOUR", "END_HOUR", "DEVICE_ID"],
-        timeout_s=2.0,
+        timeout_s=MAINTENANCE_PANEL_TIMEOUT_S,
     )
+    time.sleep(MAINTENANCE_PANEL_GAP_S)
     diagnostics = _dict_panel_lines(
         fetch_fn=protocol_get_device_diagnostics,
         device_ip=device_ip,
@@ -3937,7 +3944,7 @@ def _maintenance_panel_data(device_ip: str) -> dict[str, tuple[str, str, str]]:
             "I2C_ERRORS",
             "SD_ERRORS",
         ],
-        timeout_s=2.0,
+        timeout_s=MAINTENANCE_PANEL_TIMEOUT_S,
     )
     return {
         "RTC Time": rtc,
