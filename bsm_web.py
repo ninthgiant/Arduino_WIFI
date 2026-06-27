@@ -21,6 +21,7 @@ import datetime as dt
 import time
 import tempfile
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tempfile import TemporaryDirectory
 from contextlib import redirect_stderr, redirect_stdout
 from urllib.parse import parse_qs, urlparse
@@ -105,7 +106,7 @@ UI_STATE_LOCK = threading.Lock()
 LAST_SET_TIME_OFFSET_HOURS = WEB_SET_TIME_OFFSET_HOURS
 LAST_SET_TIME_PRESET = "ast"
 WEB_APP_NAME = "NORTH_END_IOT"
-WEB_APP_VERSION = "4.5"
+WEB_APP_VERSION = "4.6"
 WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
 UI_POLL_UPLOADS_MS = 5000
 UI_POLL_DEVICES_MS = 5000
@@ -126,6 +127,10 @@ ENDPOINT_CACHE: dict[str, tuple[float, str]] = {}
 DEVICE_RTC_CACHE_LOCK = threading.Lock()
 DEVICE_RTC_CACHE: dict[str, tuple[float, str, str]] = {}
 DEVICE_RTC_CACHE_TTL_S = 20.0
+DEVICE_POLICY_CACHE_LOCK = threading.Lock()
+DEVICE_POLICY_CACHE: dict[str, tuple[float, str]] = {}
+DEVICE_POLICY_CACHE_TTL_S = 60.0
+DEVICE_POLICY_TIMEOUT_S = 0.6
 
 
 def new_correlation_id(prefix: str = "CMD") -> str:
@@ -761,8 +766,9 @@ def read_devices_status(path: Path, online_seconds: int = 600) -> str:
     if mismatches:
         lines.append(f"WARNING: device_ip != recv_ip for {len(mismatches)} device(s): {', '.join(mismatches)}")
         lines.append("")
-    lines.append("status   burrow_id      short_uid  fw_ver   ap_id       network_uid       device_ip      recv_ip        last_seen             unique_id")
-    lines.append("------   ------------   --------   ------   ---------   ---------------   -----------   -----------    -------------------   ------------------------------------")
+    policy_by_uid = _build_wifi_policy_map(rows)
+    lines.append("status   burrow_id      short_uid  fw_ver   ap_id       network_uid       device_ip      recv_ip        last_seen             unique_id                              Sched      burrow_id      short_uid")
+    lines.append("------   ------------   --------   ------   ---------   ---------------   -----------   -----------    -------------------   ------------------------------------   --------   ------------   --------")
     for row in rows:
         status = row.get("status", "UNKNOWN")
         burrow_id = row.get("burrow_id", "")
@@ -776,7 +782,8 @@ def read_devices_status(path: Path, online_seconds: int = 600) -> str:
         dev_ip = row.get("device_ip", "")
         recv_ip = row.get("recv_ip", "")
         last_seen_raw = row.get("last_seen", "")
-        lines.append(f"{status:<6}   {burrow_id:<12}   {short_uid:<8}   {fw_ver:<6}   {ap_id:<9}   {net_uid:<15}   {dev_ip:<11}   {recv_ip:<11}    {last_seen_raw:<19}   {uid:<36}")
+        sched = policy_by_uid.get(uid, "-")
+        lines.append(f"{status:<6}   {burrow_id:<12}   {short_uid:<8}   {fw_ver:<6}   {ap_id:<9}   {net_uid:<15}   {dev_ip:<11}   {recv_ip:<11}    {last_seen_raw:<19}   {uid:<36}   {sched:<8}   {burrow_id:<12}   {short_uid:<8}")
     return "\n".join(lines)
 
 
@@ -3625,10 +3632,89 @@ def _get_cached_device_rtc_display(unique_id: str, device_ip: str, status: str) 
     return rtc_date, rtc_time
 
 
+def _query_device_wifi_policy_display(device_ip: str, timeout_s: float = DEVICE_POLICY_TIMEOUT_S) -> str:
+    """Fetch WIFI_POLICY from GET_CONFIG for one device."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(timeout_s)
+        config = protocol_get_device_config(
+            control_sock=sock,
+            device_ip=device_ip,
+            control_port=DISCOVER_CONTROL_PORT,
+            timeout_s=timeout_s,
+        )
+        policy = str(config.get("WIFI_POLICY", "") or "").strip()
+        if policy == POLICY_MORNING_ONLY:
+            return "MORN"
+        if policy == POLICY_STAY_ACTIVE:
+            return "ACTIVE"
+        return policy[:8] if policy else "-"
+    except Exception:
+        return "?"
+    finally:
+        sock.close()
+
+
+def _policy_cache_key(unique_id: str, device_ip: str) -> str:
+    return f"{(unique_id or '').strip()}|{(device_ip or '').strip()}"
+
+
+def _read_cached_policy(unique_id: str, device_ip: str) -> str | None:
+    key = _policy_cache_key(unique_id, device_ip)
+    now = time.monotonic()
+    with DEVICE_POLICY_CACHE_LOCK:
+        cached = DEVICE_POLICY_CACHE.get(key)
+        if cached and (now - cached[0]) <= DEVICE_POLICY_CACHE_TTL_S:
+            return cached[1]
+    return None
+
+
+def _write_cached_policy(unique_id: str, device_ip: str, policy: str) -> None:
+    key = _policy_cache_key(unique_id, device_ip)
+    with DEVICE_POLICY_CACHE_LOCK:
+        DEVICE_POLICY_CACHE[key] = (time.monotonic(), policy)
+
+
+def _build_wifi_policy_map(devices: list[dict[str, str]]) -> dict[str, str]:
+    """Return UID -> short WiFi policy label for online devices."""
+    out: dict[str, str] = {}
+    work: list[tuple[str, str]] = []
+    for d in devices:
+        uid = (d.get("unique_id", "") or "").strip()
+        device_ip = (d.get("device_ip", "") or d.get("recv_ip", "") or "").strip()
+        status = (d.get("status", "") or "").strip().lower()
+        if not uid or not device_ip or status not in {"online", "upload"}:
+            out[uid] = "-"
+            continue
+        cached = _read_cached_policy(uid, device_ip)
+        if cached is not None:
+            out[uid] = cached
+        else:
+            work.append((uid, device_ip))
+
+    if work:
+        max_workers = min(8, len(work))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(_query_device_wifi_policy_display, device_ip): (uid, device_ip)
+                for uid, device_ip in work
+            }
+            for fut in as_completed(futures):
+                uid, device_ip = futures[fut]
+                try:
+                    policy = fut.result()
+                except Exception:
+                    policy = "?"
+                _write_cached_policy(uid, device_ip, policy)
+                out[uid] = policy
+    return out
+
+
 def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) -> str:
     """Build device select rows."""
     rows: list[tuple[str, str, str]] = []
     mismatches: list[str] = []
+    policy_by_uid = _build_wifi_policy_map(devices)
     for d in devices:
         uid = (d.get("unique_id", "") or "").strip()
         short_uid = (d.get("short_uid", "") or "").strip()
@@ -3652,10 +3738,12 @@ def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) 
         if dev_ip_raw and raw_recv_ip and dev_ip_raw != raw_recv_ip:
             mismatches.append(short_uid if short_uid else uid)
         last_seen_raw = (d.get("last_seen", "") or "").strip()
+        sched = policy_by_uid.get(uid, "-")
         line = (
             f"{status:<6}   {burrow:<12}   {short_uid:<8}   {fw_ver:<6}   "
             f"{ap_id:<9}   {net_uid:<15}   {rtc_date:<10}   {rtc_time:<8}   "
-            f"{ip:<14}   {recv_ip:<14}    {last_seen_raw:<19}   {uid:<36}"
+            f"{ip:<14}   {recv_ip:<14}    {last_seen_raw:<19}   {uid:<36}   "
+            f"{sched:<8}   {burrow:<12}   {short_uid:<8}"
         )
         rows.append((uid, short_uid, line))
     if not rows:
@@ -3668,8 +3756,8 @@ def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) 
             + html.escape(f"Warning: device_ip != recv_ip for {len(mismatches)} device(s): {', '.join(mismatches)}")
             + "</div>"
         )
-    out.append('<div class="device-head">status   burrow_id      short_uid  fw_ver   ap_id       network_uid       rtc_date     rtc_time   device_ip         recv_ip           last_seen             unique_id</div>')
-    out.append('<div class="device-sep">------   ------------   --------   ------   ---------   ---------------   ----------   --------   --------------    --------------    -------------------   ------------------------------------</div>')
+    out.append('<div class="device-head">status   burrow_id      short_uid  fw_ver   ap_id       network_uid       rtc_date     rtc_time   device_ip         recv_ip           last_seen             unique_id                              Sched      burrow_id      short_uid</div>')
+    out.append('<div class="device-sep">------   ------------   --------   ------   ---------   ---------------   ----------   --------   --------------    --------------    -------------------   ------------------------------------   --------   ------------   --------</div>')
     for uid, short_uid, line in rows:
         selected_cls = " selected" if uid == selected_uid else ""
         out.append(
@@ -4787,6 +4875,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_html(render_maintenance_page(message="Selected Arduino has no IP address.", selected_uid=selected_uid))
                     return True
                 apply_msg = set_device_wifi_policy(device_ip=device_ip, policy=clean)
+                policy_label = "MORN" if clean["policy"] == POLICY_MORNING_ONLY else "ACTIVE"
+                _write_cached_policy(selected_uid, device_ip, policy_label)
                 msg = f"{msg} {apply_msg}"
             append_action_log("maintenance-wifi-policy", msg)
             self._send_html(render_maintenance_page(message=msg, selected_uid=selected_uid))
