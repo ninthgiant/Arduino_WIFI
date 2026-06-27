@@ -3926,7 +3926,17 @@ def _maintenance_panel_data(device_ip: str) -> dict[str, tuple[str, str, str]]:
     diagnostics = _dict_panel_lines(
         fetch_fn=protocol_get_device_diagnostics,
         device_ip=device_ip,
-        fallback_order=["RTC_OK", "RTC_ERRORS", "I2C_ERRORS", "SD_ERRORS"],
+        fallback_order=[
+            "RTC_OK",
+            "RTC_TIME",
+            "CACHE_TIME",
+            "CACHE_SOURCE",
+            "CACHE_AGE_SEC",
+            "CACHE_RTC_DELTA_SEC",
+            "RTC_ERRORS",
+            "I2C_ERRORS",
+            "SD_ERRORS",
+        ],
         timeout_s=2.0,
     )
     return {
