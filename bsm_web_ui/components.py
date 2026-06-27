@@ -69,6 +69,24 @@ def _base_page_css() -> str:
       line-height: 1.35;
     }
     .known-arduino-box { height: 320px; }
+    .known-sort-control {
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+      margin: 0 0 0.45rem 0;
+      font-family: "Avenir Next", "Trebuchet MS", sans-serif;
+      font-size: 0.9rem;
+      font-weight: 700;
+      color: #304a64;
+    }
+    .known-sort-control select {
+      padding: 0.35rem 0.45rem;
+      border: 1px solid #9cb2c9;
+      border-radius: 4px;
+      background: #fff;
+      color: #1f2937;
+      font-size: 0.9rem;
+    }
     """
 
 
@@ -141,12 +159,22 @@ def _render_known_arduinos_selector(
     action: str,
     selected_uid: str,
     device_rows_html_block: str,
+    sort_mode: str = "last_seen",
     button_label: str = "",
     button_class: str = "needs-device",
     show_button: bool = True,
 ) -> str:
     """Render the common 'Known Arduinos' selector block."""
 
+    sort_options = [
+        ("last_seen", "Last seen"),
+        ("burrow_id", "Burrow ID"),
+        ("short_uid", "Short UID"),
+    ]
+    sort_html = "\n".join(
+        f'      <option value="{html.escape(value)}"{" selected" if sort_mode == value else ""}>{html.escape(label)}</option>'
+        for value, label in sort_options
+    )
     button_html = ""
     if show_button:
         button_html = (
@@ -158,6 +186,10 @@ def _render_known_arduinos_selector(
         f"{_render_section_title('Known Arduinos (select one)')}\n"
         f"<form method=\"get\" action=\"{html.escape(action)}\">\n"
         f"  <input type=\"hidden\" name=\"uid\" value=\"{html.escape(selected_uid)}\" class=\"selected-uid-field\" />\n"
+        "  <div class=\"known-sort-control\">\n"
+        "    <label for=\"known_sort\">Sort:</label>\n"
+        f"    <select id=\"known_sort\" name=\"sort\" onchange=\"this.form.submit()\">\n{sort_html}\n    </select>\n"
+        "  </div>\n"
         f"  <div class=\"scrollbox known-arduino-box\">{device_rows_html_block}</div>\n"
         f"{button_html}"
         "</form>"

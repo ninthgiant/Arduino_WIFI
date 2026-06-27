@@ -106,7 +106,7 @@ UI_STATE_LOCK = threading.Lock()
 LAST_SET_TIME_OFFSET_HOURS = WEB_SET_TIME_OFFSET_HOURS
 LAST_SET_TIME_PRESET = "ast"
 WEB_APP_NAME = "NORTH_END_IOT"
-WEB_APP_VERSION = "4.6"
+WEB_APP_VERSION = "4.7"
 WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
 UI_POLL_UPLOADS_MS = 5000
 UI_POLL_DEVICES_MS = 5000
@@ -749,9 +749,45 @@ def _iso_to_dt(value: str) -> dt.datetime | None:
         return None
 
 
-def read_devices_status(path: Path, online_seconds: int = 600) -> str:
+def normalize_device_sort(sort_mode: str) -> str:
+    """Normalize Known Arduinos sort mode."""
+    value = (sort_mode or "last_seen").strip().lower()
+    if value in {"last_seen", "burrow_id", "short_uid"}:
+        return value
+    return "last_seen"
+
+
+def sort_device_rows(rows: list[dict[str, str]], sort_mode: str) -> list[dict[str, str]]:
+    """Sort device rows for Known Arduinos displays."""
+    mode = normalize_device_sort(sort_mode)
+
+    def short_uid_value(row: dict[str, str]) -> str:
+        uid = (row.get("unique_id", "") or "").strip()
+        short_uid = (row.get("short_uid", "") or "").strip()
+        return short_uid or (uid[-6:] if len(uid) >= 6 else uid)
+
+    if mode == "burrow_id":
+        return sorted(
+            rows,
+            key=lambda r: (
+                1 if not (r.get("burrow_id", "") or "").strip() else 0,
+                (r.get("burrow_id", "") or "").strip().lower(),
+                short_uid_value(r).lower(),
+            ),
+        )
+    if mode == "short_uid":
+        return sorted(rows, key=lambda r: (short_uid_value(r).lower(), (r.get("burrow_id", "") or "").strip().lower()))
+
+    return sorted(
+        rows,
+        key=lambda r: _iso_to_dt((r.get("last_seen", "") or "").strip()) or dt.datetime.min,
+        reverse=True,
+    )
+
+
+def read_devices_status(path: Path, online_seconds: int = 600, sort_mode: str = "last_seen") -> str:
     """Read devices status."""
-    rows = read_devices_rows(path, online_seconds=online_seconds)
+    rows = sort_device_rows(read_devices_rows(path, online_seconds=online_seconds), sort_mode)
     if not rows:
         return "(No devices discovered yet)"
 
@@ -2256,10 +2292,11 @@ def get_maintenance_panels_payload(selected_uid: str) -> dict[str, object]:
     return {"ok": True, "short_uid": short_uid, "panels": payload_panels}
 
 
-def get_devices_table_payload() -> dict[str, object]:
+def get_devices_table_payload(sort_mode: str = "last_seen") -> dict[str, object]:
     """Return shared Known Arduinos HTML table payload for dashboard."""
-    devices = read_devices_rows(Path("data/discovered_devices.csv"))
-    html_block = _build_device_select_rows(devices, selected_uid="")
+    sort_mode = normalize_device_sort(sort_mode)
+    devices = sort_device_rows(read_devices_rows(Path("data/discovered_devices.csv")), sort_mode)
+    html_block = _build_device_select_rows(devices, selected_uid="", sort_mode=sort_mode)
     mismatches: list[str] = []
     for d in devices:
         uid = (d.get("unique_id", "") or "").strip()
@@ -2346,15 +2383,16 @@ def get_rf_data_remote_preview_payload(selected_uid: str, remote_filename: str) 
         sock.close()
 
 
-def render_rf_data_page(message: str = "", selected_uid: str = "") -> bytes:
+def render_rf_data_page(message: str = "", selected_uid: str = "", sort_mode: str = "last_seen") -> bytes:
     """Render RF Data page with remote/local lists plus file-content preview panel."""
     running, pid = MANAGER.status()
     state = f"RUNNING (PID {pid})" if running else "STOPPED"
     ctx = PageContext(page_title=f"{WEB_APP_NAME} - RF Data", state=state, message=message, subtitle="RF Data")
+    sort_mode = normalize_device_sort(sort_mode)
     devices = read_devices_rows(Path("data/discovered_devices.csv"))
     selected_uid = (selected_uid or "").strip()
     selected_device = _find_device_by_uid(devices, selected_uid)
-    device_rows_html_block = _build_device_select_rows(devices, selected_uid)
+    device_rows_html_block = _build_device_select_rows(devices, selected_uid, sort_mode=sort_mode)
 
     selected_short = ""
     remote_note = "(Select a known Arduino to view SD files)"
@@ -2405,6 +2443,7 @@ def render_rf_data_page(message: str = "", selected_uid: str = "") -> bytes:
           action="/rf-data",
           selected_uid=selected_uid,
           device_rows_html_block=device_rows_html_block,
+          sort_mode=sort_mode,
           button_label="Load RF Data",
           show_button=False,
       )}
@@ -2706,11 +2745,21 @@ def render_rf_data_page(message: str = "", selected_uid: str = "") -> bytes:
     )
 
 
-def render_page(message: str = "") -> bytes:
+def render_page(message: str = "", sort_mode: str = "last_seen") -> bytes:
     """Render page."""
+    sort_mode = normalize_device_sort(sort_mode)
     running, pid = MANAGER.status()
     state = f"RUNNING (PID {pid})" if running else "STOPPED"
     ctx = PageContext(page_title=WEB_APP_NAME, state=state, message=message)
+    sort_options = [
+        ("last_seen", "Last seen"),
+        ("burrow_id", "Burrow ID"),
+        ("short_uid", "Short UID"),
+    ]
+    sort_options_html = "\n".join(
+        f'<option value="{html.escape(value)}"{" selected" if sort_mode == value else ""}>{html.escape(label)}</option>'
+        for value, label in sort_options
+    )
     extra_css = """
     .placeholder-btn { background: var(--accent); color: #0b2d4b; border-color: #8db4da; }
     .device-head, .device-sep { white-space: pre; }
@@ -2759,6 +2808,12 @@ def render_page(message: str = "") -> bytes:
       </div>
 
       {_render_section_title("Known Arduinos")}
+      <div class="known-sort-control">
+        <label for="known_sort">Sort:</label>
+        <select id="known_sort" name="sort">
+{sort_options_html}
+        </select>
+      </div>
       <div id="mismatch-banner" class="warn-banner"></div>
       {_render_scrollbox("devicebox", "Loading Arduino status...", "known-arduino-box")}
 
@@ -2774,6 +2829,7 @@ def render_page(message: str = "") -> bytes:
     const uploadsbox = document.getElementById("uploadsbox");
     const activitybox = document.getElementById("activitybox");
     const mismatchBanner = document.getElementById("mismatch-banner");
+    const knownSort = document.getElementById("known_sort");
     let uploadsTimer = null;
     let devicesTimer = null;
     let activityTimer = null;
@@ -2805,7 +2861,8 @@ def render_page(message: str = "") -> bytes:
 
     async function refreshDevices() {{
       try {{
-        const resp = await fetch("/api/devices-table", {{ cache: "no-store" }});
+        const sortValue = knownSort ? (knownSort.value || "last_seen") : "last_seen";
+        const resp = await fetch("/api/devices-table?sort=" + encodeURIComponent(sortValue), {{ cache: "no-store" }});
         if (!resp.ok) {{
           return;
         }}
@@ -2829,6 +2886,9 @@ def render_page(message: str = "") -> bytes:
       }} catch (_err) {{
         // Keep last displayed text on transient fetch errors.
       }}
+    }}
+    if (knownSort) {{
+      knownSort.addEventListener("change", () => refreshDevices());
     }}
 
     async function refreshActivity() {{
@@ -2889,11 +2949,12 @@ def render_page(message: str = "") -> bytes:
     )
 
 
-def render_file_transfers_page(message: str = "", selected_uid: str = "") -> bytes:
+def render_file_transfers_page(message: str = "", selected_uid: str = "", sort_mode: str = "last_seen") -> bytes:
     """Render file transfers page."""
     running, pid = MANAGER.status()
     state = f"RUNNING (PID {pid})" if running else "STOPPED"
     ctx = PageContext(page_title=f"{WEB_APP_NAME} - File Transfers", state=state, message=message, subtitle="File Transfers")
+    sort_mode = normalize_device_sort(sort_mode)
     devices = read_devices_rows(Path("data/discovered_devices.csv"))
     selected_uid = (selected_uid or "").strip()
 
@@ -2903,7 +2964,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
             selected_device = d
             break
 
-    device_rows_html_block = _build_device_select_rows(devices, selected_uid)
+    device_rows_html_block = _build_device_select_rows(devices, selected_uid, sort_mode=sort_mode)
 
     selected_short = ""
     remote_note = "(Select a known Arduino to view SD files)"
@@ -3022,6 +3083,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "") -> byt
           action="/file-transfers",
           selected_uid=selected_uid,
           device_rows_html_block=device_rows_html_block,
+          sort_mode=sort_mode,
           button_label="Load File Lists",
           show_button=False,
       )}
@@ -3710,8 +3772,9 @@ def _build_wifi_policy_map(devices: list[dict[str, str]]) -> dict[str, str]:
     return out
 
 
-def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str) -> str:
+def _build_device_select_rows(devices: list[dict[str, str]], selected_uid: str, sort_mode: str = "last_seen") -> str:
     """Build device select rows."""
+    devices = sort_device_rows(devices, sort_mode)
     rows: list[tuple[str, str, str]] = []
     mismatches: list[str] = []
     policy_by_uid = _build_wifi_policy_map(devices)
@@ -4100,11 +4163,17 @@ def _mini_panel_block(header: str, separator: str, values: str) -> str:
     return f"{header}\n{separator}\n{values}"
 
 
-def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_input: str | None = None) -> bytes:
+def render_maintenance_page(
+    message: str = "",
+    selected_uid: str = "",
+    burrow_input: str | None = None,
+    sort_mode: str = "last_seen",
+) -> bytes:
     """Render maintenance page."""
     running, pid = MANAGER.status()
     state = f"RUNNING (PID {pid})" if running else "STOPPED"
     ctx = PageContext(page_title=f"{WEB_APP_NAME} - Maintenance", state=state, message=message, subtitle="Maintenance")
+    sort_mode = normalize_device_sort(sort_mode)
     devices = read_devices_rows(Path("data/discovered_devices.csv"))
     selected_uid = (selected_uid or "").strip()
     selected_device = _find_device_by_uid(devices, selected_uid)
@@ -4134,7 +4203,7 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
             "Config": "loading...",
             "Diagnostics": "loading...",
         }
-    device_rows_html_block = _build_device_select_rows(devices, selected_uid)
+    device_rows_html_block = _build_device_select_rows(devices, selected_uid, sort_mode=sort_mode)
 
     tz_options = [
         ("ast", "AST (UTC-4)"),
@@ -4184,6 +4253,7 @@ def render_maintenance_page(message: str = "", selected_uid: str = "", burrow_in
           action="/maintenance",
           selected_uid=selected_uid,
           device_rows_html_block=device_rows_html_block,
+          sort_mode=sort_mode,
           button_label="Load Maintenance Info",
           show_button=False,
       )}
@@ -4407,11 +4477,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send_text(get_cached_text("health-status", ENDPOINT_CACHE_TTL_S, lambda: format_health_status_text(get_health_payload())))
             return True
         if route == "/devices":
+            sort_mode = normalize_device_sort((query.get("sort") or ["last_seen"])[0])
             self._send_text(
                 get_cached_text(
-                    "devices",
+                    f"devices:{sort_mode}",
                     ENDPOINT_CACHE_TTL_S,
-                    lambda: read_devices_status(Path("data/discovered_devices.csv")),
+                    lambda: read_devices_status(Path("data/discovered_devices.csv"), sort_mode=sort_mode),
                 )
             )
             return True
@@ -4451,7 +4522,8 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_get_api_routes(self, route: str, query: dict[str, list[str]]) -> bool:
         """Serve JSON data endpoints for File Transfers/Maintenance pages."""
         if route == "/api/devices-table":
-            self._send_json(get_devices_table_payload())
+            sort_mode = normalize_device_sort((query.get("sort") or ["last_seen"])[0])
+            self._send_json(get_devices_table_payload(sort_mode=sort_mode))
             return True
         if route == "/api/rf-data/preview-local":
             selected_uid = (query.get("uid") or [""])[0].strip()
@@ -4499,7 +4571,8 @@ class Handler(BaseHTTPRequestHandler):
             return True
         if route == "/rf-data":
             selected_uid = (query.get("uid") or [""])[0].strip()
-            self._send_html(render_rf_data_page(selected_uid=selected_uid))
+            sort_mode = normalize_device_sort((query.get("sort") or ["last_seen"])[0])
+            self._send_html(render_rf_data_page(selected_uid=selected_uid, sort_mode=sort_mode))
             return True
         if route == "/batch-downloads-download":
             date_raw = (query.get("date") or [""])[0].strip()
@@ -4572,14 +4645,17 @@ class Handler(BaseHTTPRequestHandler):
             return True
         if route == "/file-transfers":
             selected_uid = (query.get("uid") or [""])[0].strip()
-            self._send_html(render_file_transfers_page(selected_uid=selected_uid))
+            sort_mode = normalize_device_sort((query.get("sort") or ["last_seen"])[0])
+            self._send_html(render_file_transfers_page(selected_uid=selected_uid, sort_mode=sort_mode))
             return True
         if route == "/maintenance":
             selected_uid = (query.get("uid") or [""])[0].strip()
-            self._send_html(render_maintenance_page(selected_uid=selected_uid))
+            sort_mode = normalize_device_sort((query.get("sort") or ["last_seen"])[0])
+            self._send_html(render_maintenance_page(selected_uid=selected_uid, sort_mode=sort_mode))
             return True
         if route == "/":
-            self._send_html(render_page())
+            sort_mode = normalize_device_sort((query.get("sort") or ["last_seen"])[0])
+            self._send_html(render_page(sort_mode=sort_mode))
             return True
         return False
 
