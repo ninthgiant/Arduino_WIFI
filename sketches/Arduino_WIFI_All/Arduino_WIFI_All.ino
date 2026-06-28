@@ -97,6 +97,7 @@ bool startupCalWindowComplete = false;
 uint32_t startupCalWindowEndTs = 0;
 bool startupWifiCheckPending = true;
 bool bootedInWifiWindow = false;
+bool thisBootSatisfiedWifiRebootGate = false;
 bool wifiSessionArmed = false;
 bool wasInWifiWindow = false;
 bool wifiWindowCycleInitialized = false;
@@ -240,13 +241,13 @@ const bool debug = false;
 const bool countdown = true;
 // show which build we are making
 #if defined(WIFI_PROFILE_AIRLIFT) && BSM_SENSOR_HOOK_ENABLED
-const char VERSION[] = "4.2ctd";
+const char VERSION[] = "4.3ctd";
 #elif defined(WIFI_PROFILE_AIRLIFT)
-const char VERSION[] = "4.2ctp";
+const char VERSION[] = "4.3ctp";
 #elif defined(WIFI_PROFILE_R4_WIFI) && BSM_SENSOR_HOOK_ENABLED
-const char VERSION[] = "4.2cwd";
+const char VERSION[] = "4.3cwd";
 #else
-const char VERSION[] = "4.2cwp";
+const char VERSION[] = "4.3cwp";
 #endif
 
 
@@ -2874,9 +2875,10 @@ void loop() {
     startupCalWindowComplete = false;
     startupCalWindowEndTs = unixTs + STARTUP_CAL_CAPTURE_SECONDS;
     bootedInWifiWindow = inWifiWindow;
+    thisBootSatisfiedWifiRebootGate = bootedInWifiWindow;
     // If boot occurs inside WiFi window, this boot satisfies the reboot gate.
     // Otherwise, the gate is armed later on first window entry transition.
-    wifiSessionArmed = bootedInWifiWindow;
+    wifiSessionArmed = thisBootSatisfiedWifiRebootGate;
     wifiWindowCycleInitialized = inWifiWindow;
     Serial.print(F("Startup capture begin. bootedInWifiWindow="));
     Serial.println(bootedInWifiWindow ? F("YES") : F("NO"));
@@ -2908,6 +2910,7 @@ void loop() {
     // very boot occurred inside the window and has already been calibrated.
     if (!wifiWindowCycleInitialized) {
       wifiSessionArmed = false;
+      thisBootSatisfiedWifiRebootGate = false;
       wifiLowPowerStandby = false;
       wifiModeActive = false;
       wifiInitialized = false;
@@ -2929,6 +2932,7 @@ void loop() {
     // Reset cycle state so next day's WiFi window requires a fresh reboot.
     wifiWindowCycleInitialized = false;
     wifiSessionArmed = false;
+    thisBootSatisfiedWifiRebootGate = false;
     wifiLowPowerStandby = false;
     wifiNextStandbyProbeTs = 0;
     wifiIdleAnnounced = false;
@@ -2980,6 +2984,17 @@ void loop() {
   // In WiFi window: acquisition must remain stopped.
   if (inWifiWindow) {
     closeAcqDataFile();
+    if (!thisBootSatisfiedWifiRebootGate) {
+      wifiSessionArmed = false;
+      wifiLowPowerStandby = false;
+      if (!wifiIdleAnnounced) {
+        Serial.println(F("WiFi window active. Reboot required before TRIM/WiFi."));
+        wifiIdleAnnounced = true;
+      }
+      if (printLCD) setLcdStatusLine1("WiFi: reboot req");
+      delay(250);
+      return;
+    }
     if (!wifiSessionArmed) {
       if (!wifiIdleAnnounced) {
         Serial.println(F("WiFi window active. Waiting for reboot-armed session."));
