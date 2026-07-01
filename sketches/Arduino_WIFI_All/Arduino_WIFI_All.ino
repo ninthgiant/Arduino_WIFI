@@ -160,8 +160,8 @@ const uint16_t RTC_NTP_RETRY_DELAY_MS = 500;
 const long RTC_NTP_LOCAL_OFFSET_SECONDS = -3L * 3600L;  // Align with controller local offset (UTC-3h).
 
 // Time window for WiFi phase (hours in local controller time). Default will be 7 and 19. Currently changed for testing during the day
-uint8_t START_HOUR = 7;    // testing using 1 hr window. Return to 7 to 19 for deployment
-uint8_t END_HOUR = 19;
+uint8_t START_HOUR = 8;    // testing using 1 hr window. Return to 8 to 17 for deployment and keeping wifi to min
+uint8_t END_HOUR = 17;
 // TCP chunk size used for file transfer to controller.
 // WiFiNINA/AirLift is more reliable with smaller chunks; R4 WiFi can use larger chunks.
 #if defined(WIFI_PROFILE_AIRLIFT)
@@ -176,6 +176,8 @@ const uint32_t STARTUP_CAL_CAPTURE_SECONDS = 600UL; // 60UL; // for testing, set
 const uint32_t TRIM_CALIBRATION_SECONDS = STARTUP_CAL_CAPTURE_SECONDS;
 // Fallback TR file duration when trim threshold calibration fails.
 const uint32_t TRIM_FALLBACK_SECONDS = 60UL;
+// Small problem TR file size when the expected raw DL file is missing/empty.
+const uint32_t TRIM_PROBLEM_FILE_BYTES = 102400UL; // ~0.1 MB
 // Optional guard from file start before event detection can begin.
 const uint32_t TRIM_START_GUARD_SECONDS = TRIM_CALIBRATION_SECONDS;
 // Seconds of context retained before event trigger time.
@@ -241,13 +243,13 @@ const bool debug = false;
 const bool countdown = true;
 // show which build we are making
 #if defined(WIFI_PROFILE_AIRLIFT) && BSM_SENSOR_HOOK_ENABLED
-const char VERSION[] = "4.3ctd";
+const char VERSION[] = "4.4ctd";
 #elif defined(WIFI_PROFILE_AIRLIFT)
-const char VERSION[] = "4.3ctp";
+const char VERSION[] = "4.4ctp";
 #elif defined(WIFI_PROFILE_R4_WIFI) && BSM_SENSOR_HOOK_ENABLED
-const char VERSION[] = "4.3cwd";
+const char VERSION[] = "4.4cwd";
 #else
-const char VERSION[] = "4.3cwp";
+const char VERSION[] = "4.4cwp";
 #endif
 
 
@@ -1045,9 +1047,10 @@ String findLatestTrimmedTrFilename() {
  ***********************/
 String determineReadyUploadFilename() {
   String rawName = trimRawFilenameByDatePolicy();
-  if (rawName.length() > 0 && SD.exists(rawName.c_str())) {
+  if (rawName.length() > 0) {
     String trimName = trimFilenameFromRaw(rawName);
     if (SD.exists(trimName.c_str())) return trimName;
+    if (!TRIM_USE_TODAY_FILENAME) return "";
   }
   String latestTr = findLatestTrimmedTrFilename();
   if (latestTr.length() > 0 && (TRIM_USE_TODAY_FILENAME || !isTodayTrimFilename(latestTr))) return latestTr;
@@ -1457,6 +1460,74 @@ bool writeTrimFallbackCalibrationOnly(const String &inputName, const String &out
 }
 
 /***********************
+ * Writes a very small problem TR file when the date-policy raw file is unusable.
+ * The tiny upload is intentional: it preserves the date-named TR file and signals
+ * that the user should inspect that day.
+ * @param rawName Expected raw filename.
+ * @param reason Short marker reason.
+ * @return True when problem file and ready marker were written.
+ ***********************/
+bool writeSmallProblemTrimFile(const String &rawName, const char *reason) {
+  if (rawName.length() == 0) return false;
+
+  String trimName = trimFilenameFromRaw(rawName);
+  String markerName = trimReadyMarkerFilename(trimName);
+  SD.remove(markerName.c_str());
+  SD.remove(trimName.c_str());
+
+  File out = SD.open(trimName.c_str(), FILE_WRITE);
+  if (!out) {
+    Serial.println(F("TRIM problem fail: open output"));
+    return false;
+  }
+
+  uint32_t ts = Get_TimeStamp();
+  uint32_t written = 0;
+  uint32_t rows = 0;
+  while (written < TRIM_PROBLEM_FILE_BYTES) {
+    char line[48];
+    int n = snprintf(line, sizeof(line), "0, %lu\n", (unsigned long)ts);
+    if (n <= 0 || n >= (int)sizeof(line)) {
+      out.close();
+      Serial.println(F("TRIM problem fail: format"));
+      return false;
+    }
+    size_t w = out.write((const uint8_t *)line, (size_t)n);
+    if (w != (size_t)n) {
+      out.close();
+      Serial.println(F("TRIM problem fail: write"));
+      return false;
+    }
+    written += (uint32_t)w;
+    rows++;
+  }
+  out.close();
+
+  File marker = SD.open(markerName.c_str(), FILE_WRITE);
+  if (!marker) {
+    Serial.println(F("TRIM problem fail: marker write"));
+    return false;
+  }
+  marker.print(F("PROBLEM,"));
+  marker.print(reason);
+  marker.print(F(","));
+  marker.print(rawName);
+  marker.print(F(","));
+  marker.println(rows);
+  marker.close();
+
+  Serial.print(F("TRIM problem file: "));
+  Serial.print(trimName);
+  Serial.print(F(" reason="));
+  Serial.print(reason);
+  Serial.print(F(" bytes="));
+  Serial.print((unsigned long)written);
+  Serial.print(F(" rows="));
+  Serial.println((unsigned long)rows);
+  return true;
+}
+
+/***********************
  * Ensures a TR file exists and is ready before WiFi upload session.
  * If TR exists and non-empty, skip re-trim; otherwise build it.
  * @return True when TR file is ready for transfer.
@@ -1465,17 +1536,32 @@ bool ensureTrimmedFileReadyForWifi() {
   if (!sdReady) return false;
 
   String rawName = trimRawFilenameByDatePolicy();
-  if (rawName.length() == 0 || !SD.exists(rawName.c_str())) {
-    rawName = findLatestRawDlFilename();
+  if (rawName.length() == 0) {
+    Serial.println(F("TRIM fail: no date-policy raw target"));
+    return false;
   }
+
+  Serial.print(F("TRIM date target: "));
+  Serial.println(rawName);
+
+  String trimName = trimFilenameFromRaw(rawName);
+
   if (!TRIM_USE_TODAY_FILENAME && isTodayRawFilename(rawName)) {
     Serial.print(F("TRIM skip today raw: "));
     Serial.println(rawName);
-    rawName = "";
-  }
-  if (rawName.length() == 0 || !SD.exists(rawName.c_str())) {
-    Serial.println(F("TRIM skip: no eligible raw DL file found."));
     return true;
+  }
+
+  if (!SD.exists(rawName.c_str())) {
+    if (SD.exists(trimName.c_str()) && hasTrimReadyMarker(trimName)) {
+      Serial.print(F("TRIM ready problem: "));
+      Serial.println(trimName);
+      return true;
+    }
+    Serial.print(F("TRIM missing raw target: "));
+    Serial.println(rawName);
+    setLcdStatusLine1("Trim: no raw");
+    return writeSmallProblemTrimFile(rawName, "MISSING_RAW");
   }
 
   Serial.print(F("TRIM raw target: "));
@@ -1486,13 +1572,13 @@ bool ensureTrimmedFileReadyForWifi() {
   if (rawFile) {
     if (rawFile.size() == 0) {
       rawFile.close();
-      Serial.println(F("TRIM skip: empty raw file, proceeding without trim"));
-      return true;
+      Serial.println(F("TRIM empty raw target"));
+      setLcdStatusLine1("Trim: empty raw");
+      return writeSmallProblemTrimFile(rawName, "EMPTY_RAW");
     }
     rawFile.close();
   }
 
-  String trimName = trimFilenameFromRaw(rawName);
   if (SD.exists(trimName.c_str())) {
     File f = SD.open(trimName.c_str(), FILE_READ);
     unsigned long sz = f ? (unsigned long) f.size() : 0UL;
