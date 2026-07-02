@@ -594,39 +594,41 @@ def _transfer_latest_file_for_device(
             except Exception as exc:
                 print(f"Warning: DB read failed (active transfer check): {exc}")
 
-        remote_files = request_remote_file_list(
-            control_sock=control_sock,
-            device_ip=device_ip,
-            control_port=args.discover_port,
-            timeout_s=args.file_list_timeout,
-        )
-        if not remote_files:
-            base_result["status"] = "skip"
-            base_result["message"] = f"No files reported by {display_id} ({device_ip}).{rtc_sync_note}"
-            return base_result
-        remote_txt_files = [name for name in remote_files if str(name).lower().endswith(".txt")]
-        if not remote_txt_files:
-            base_result["status"] = "skip"
-            base_result["message"] = f"No .txt files reported by {display_id} ({device_ip}).{rtc_sync_note}"
-            return base_result
-
         seen = load_received_filenames(file_log_root, uid, device_short_uid=short_uid)
         next_file = ""
-        # READY-driven mode: prefer explicit filename announced by Arduino beacon.
+
+        # READY-driven mode: trust the explicit filename announced by Arduino.
+        # This avoids a full SD root LIST_FILES scan on units with many large files.
         if bool(getattr(args, "ready_driven", False)) and ready_filename:
-            ready_match = None
-            for name in remote_txt_files:
-                if str(name).strip().lower() == ready_filename.lower():
-                    ready_match = str(name).strip()
-                    break
-            if ready_match:
-                if args.transfer_latest_even_if_seen or ready_match not in seen:
-                    next_file = ready_match
-                else:
-                    base_result["status"] = "skip"
-                    base_result["source_filename"] = ready_match
-                    base_result["message"] = f"No new files to fetch for {display_id} (READY file already saved).{rtc_sync_note}"
-                    return base_result
+            if not ready_filename.lower().endswith(".txt"):
+                base_result["status"] = "skip"
+                base_result["message"] = f"READY file is not .txt for {display_id}: {ready_filename}.{rtc_sync_note}"
+                return base_result
+            if args.transfer_latest_even_if_seen or ready_filename not in seen:
+                next_file = ready_filename
+                remote_files = [ready_filename]
+                remote_txt_files = [ready_filename]
+            else:
+                base_result["status"] = "skip"
+                base_result["source_filename"] = ready_filename
+                base_result["message"] = f"No new files to fetch for {display_id} (READY file already saved).{rtc_sync_note}"
+                return base_result
+        else:
+            remote_files = request_remote_file_list(
+                control_sock=control_sock,
+                device_ip=device_ip,
+                control_port=args.discover_port,
+                timeout_s=args.file_list_timeout,
+            )
+            if not remote_files:
+                base_result["status"] = "skip"
+                base_result["message"] = f"No files reported by {display_id} ({device_ip}).{rtc_sync_note}"
+                return base_result
+            remote_txt_files = [name for name in remote_files if str(name).lower().endswith(".txt")]
+            if not remote_txt_files:
+                base_result["status"] = "skip"
+                base_result["message"] = f"No .txt files reported by {display_id} ({device_ip}).{rtc_sync_note}"
+                return base_result
 
         if not next_file:
             if args.transfer_latest_even_if_seen:
