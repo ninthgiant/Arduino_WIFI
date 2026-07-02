@@ -106,7 +106,7 @@ UI_STATE_LOCK = threading.Lock()
 LAST_SET_TIME_OFFSET_HOURS = WEB_SET_TIME_OFFSET_HOURS
 LAST_SET_TIME_PRESET = "ast"
 WEB_APP_NAME = "NORTH_END_IOT"
-WEB_APP_VERSION = "4.7"
+WEB_APP_VERSION = "4.8"
 WEB_APP_HEADER = f"{WEB_APP_NAME} (version {WEB_APP_VERSION})"
 UI_POLL_UPLOADS_MS = 5000
 UI_POLL_DEVICES_MS = 5000
@@ -2000,6 +2000,13 @@ def _build_remote_rows_html(rows: list[tuple[str, int]]) -> str:
     return "".join(out)
 
 
+def default_yesterday_tr_filename(now: dt.datetime | None = None) -> str:
+    """Return yesterday's default TR filename using local Gateway date."""
+    base = now if now is not None else dt.datetime.now()
+    target = base.date() - dt.timedelta(days=1)
+    return f"TR{target.year % 100:02d}{target.month:02d}{target.day:02d}.TXT"
+
+
 def upload_selected_remote_file(
     unique_id: str,
     short_uid: str,
@@ -2239,18 +2246,12 @@ def get_file_transfers_remote_files_payload(selected_uid: str) -> dict[str, obje
     uid = (selected_uid or "").strip()
     if not uid:
         return {"ok": False, "message": "missing uid"}
-    _device, short_uid, device_ip = _resolve_device_context_for_uid(uid)
-    if not device_ip:
-        return {"ok": False, "message": "Selected Arduino has no IP address."}
-    ok, reason = can_web_access_file_transfers(uid, "LIST_FILES")
-    if not ok:
-        return {"ok": False, "message": reason}
-    remote_items, remote_err = _request_remote_file_list_with_sizes(device_ip, timeout_s=8.0)
-    if remote_err:
-        return {"ok": True, "short_uid": short_uid, "html": "", "note": f"(Could not fetch files: {remote_err})"}
-    if not remote_items:
-        return {"ok": True, "short_uid": short_uid, "html": "", "note": "(No files reported by Arduino)"}
-    return {"ok": True, "short_uid": short_uid, "html": _build_remote_rows_html(remote_items), "note": ""}
+    _device, short_uid, _device_ip = _resolve_device_context_for_uid(uid)
+    note = (
+        "SD listing disabled to avoid slow LIST_FILES on large SD cards. "
+        "Use exact filename upload."
+    )
+    return {"ok": True, "short_uid": short_uid, "html": "", "note": note}
 
 
 def get_file_transfers_uploaded_files_payload(selected_uid: str) -> dict[str, object]:
@@ -2976,6 +2977,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "", sort_m
     remote_note = "(Select a known Arduino to view SD files)"
     uploaded_note = "(Select a known Arduino to view Gateway-saved files)"
     history_text = "(Select a known Arduino to view complete DB history)"
+    default_remote_filename = default_yesterday_tr_filename()
     active_rows: list[dict[str, str]] = []
     active_error = ""
     try:
@@ -3012,7 +3014,10 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "", sort_m
         selected_short = (selected_device.get("short_uid", "") or "").strip()
         if not selected_short:
             selected_short = selected_uid[-6:] if len(selected_uid) >= 6 else selected_uid
-        remote_note = "Loading files from Arduino..."
+        remote_note = (
+            "SD listing disabled to avoid slow LIST_FILES on large SD cards. "
+            "Use exact filename upload."
+        )
         uploaded_note = "Loading Gateway-saved file list..."
         history_text = "Loading SQLite history..."
 
@@ -3033,6 +3038,24 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "", sort_m
     .grid2 { margin-top: 0.8rem; display: grid; gap: 0.8rem; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
     .grid2 > div { min-width: 0; }
     .list-actions { display: flex; justify-content: flex-end; gap: 0.4rem; margin-bottom: 0.25rem; min-height: 2.2rem; }
+    .exact-upload {
+      display: flex;
+      gap: 0.4rem;
+      align-items: center;
+      margin-bottom: 0.35rem;
+      flex-wrap: wrap;
+    }
+    .exact-upload label { font-weight: 700; }
+    .exact-upload input[type="text"] {
+      width: 11rem;
+      max-width: 100%;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .sd-disabled-note {
+      color: #5f6b7a;
+      font-style: italic;
+      line-height: 1.35;
+    }
     .delete-btn { background: #c53030; border-color: #9b2c2c; }
     .progress-overlay {
       position: fixed;
@@ -3097,17 +3120,20 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "", sort_m
       <div class="grid2">
         <div>
           <div class="section-title" id="files-on-title">{html.escape(f"Arduino SD files on {files_title_suffix}")}</div>
-          <div class="list-actions">
+          <div class="exact-upload">
             <form method="post" action="/file-transfers-upload-selected" id="sd-upload-form">
               <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
-              <input type="hidden" name="remote_filename" value="" id="sd-selected-name" />
+              <label for="sd-selected-name">Exact SD filename</label>
+              <input type="text" name="remote_filename" value="{html.escape(default_remote_filename)}" id="sd-selected-name" autocomplete="off" />
               <input type="hidden" name="upload_op_id" value="" id="sd-upload-op-id" />
-              <button type="submit" id="sd-upload-button">Upload</button>
+              <button type="submit" id="sd-upload-button">Upload Exact File</button>
             </form>
+          </div>
+          <div class="list-actions">
             <form method="post" action="/file-transfers-delete-sd" id="sd-delete-form">
               <input type="hidden" name="uid" value="{html.escape(selected_uid)}" class="selected-uid-field" />
               <input type="hidden" name="remote_filename" value="" id="sd-delete-selected-name" />
-              <button type="submit" class="delete-btn" id="sd-delete-button">Delete on SD</button>
+              <button type="submit" class="delete-btn" id="sd-delete-button" disabled>Delete on SD</button>
             </form>
           </div>
           {_render_scrollbox("sd-list-box", remote_note)}
@@ -3145,6 +3171,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "", sort_m
 """
     script_js = f"""
   (function() {{
+    const defaultRemoteFilename = "{html.escape(default_remote_filename, quote=True)}";
     const rows = Array.from(document.querySelectorAll(".device-row"));
     const uidFields = Array.from(document.querySelectorAll(".selected-uid-field"));
     const needsDeviceControls = Array.from(document.querySelectorAll(".needs-device"));
@@ -3237,15 +3264,16 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "", sort_m
     }}
     function updateActionButtons() {{
       const hasUid = uidFields.some((f) => ((f.value || "").trim().length > 0));
+      const exactFilename = sdSelectedName ? (sdSelectedName.value || "").trim() : "";
       needsDeviceControls.forEach((el) => {{
         el.disabled = !hasUid;
       }});
       const sdSelectedCount = getSelectedSdRows().length;
       const uploadedSelectedCount = getSelectedUploadRows().length;
-      if (sdUploadButton) sdUploadButton.disabled = !(hasUid && sdSelectedCount === 1);
+      if (sdUploadButton) sdUploadButton.disabled = !(hasUid && exactFilename.length > 0);
       if (sdDeleteButton) {{
-        sdDeleteButton.disabled = !(hasUid && sdSelectedCount > 0);
-        sdDeleteButton.textContent = sdSelectedCount > 1 ? "Delete on SD (" + sdSelectedCount + ")" : "Delete on SD";
+        sdDeleteButton.disabled = true;
+        sdDeleteButton.textContent = "Delete on SD";
       }}
       if (uploadedDownloadButton) uploadedDownloadButton.disabled = !(hasUid && uploadedSelectedCount === 1);
       if (uploadedDeleteButton) {{
@@ -3264,7 +3292,7 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "", sort_m
       }});
       if (filesOnTitle) filesOnTitle.textContent = "Arduino SD files on " + selectedShort;
       if (filesUploadedTitle) filesUploadedTitle.textContent = "Gateway files saved for " + selectedShort;
-      if (sdSelectedName) sdSelectedName.value = "";
+      if (sdSelectedName) sdSelectedName.value = defaultRemoteFilename;
       if (sdDeleteSelectedName) sdDeleteSelectedName.value = "";
       if (selectedPath) selectedPath.value = "";
       if (selectedName) selectedName.value = "";
@@ -3329,28 +3357,10 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "", sort_m
       if (!sdListBox) return;
       if (!uid) {{
         sdListBox.textContent = "(Select a known Arduino to view SD files)";
-        setSelectedSdRow(null);
+        updateActionButtons();
         return;
       }}
-      sdListBox.textContent = "Loading files from Arduino...";
-      try {{
-        const resp = await fetch("/api/file-transfers/remote-files?uid=" + encodeURIComponent(uid), {{ cache: "no-store" }});
-        const payload = await resp.json();
-        if (!resp.ok || !payload || !payload.ok) {{
-          sdListBox.textContent = offlineSdMessage(uid);
-          setSelectedSdRow(null);
-          return;
-        }}
-        if (payload.html && payload.html.length > 0) {{
-          sdListBox.innerHTML = payload.html;
-        }} else {{
-          sdListBox.textContent = payload.note || "(No files reported by Arduino)";
-        }}
-      }} catch (_err) {{
-        sdListBox.textContent = offlineSdMessage(uid);
-      }}
-      setSelectedSdRow(null);
-      bindSdRows();
+      sdListBox.innerHTML = '<div class="sd-disabled-note">SD listing disabled to avoid slow LIST_FILES on large SD cards. Use the exact filename upload box above. Default is yesterday\\'s TR file; edit to DL or another exact filename if needed.</div>';
       updateActionButtons();
     }}
     async function loadUploadedFiles(uid) {{
@@ -3410,10 +3420,18 @@ def render_file_transfers_page(message: str = "", selected_uid: str = "", sort_m
       ]);
     }}
     if (uploadForm) {{
+      if (sdSelectedName) {{
+        sdSelectedName.addEventListener("input", updateActionButtons);
+      }}
       uploadForm.addEventListener("submit", (ev) => {{
         ev.preventDefault();
-        const name = (sdSelectedName && sdSelectedName.value) ? sdSelectedName.value : "selected file";
-        const ok = window.confirm("Upload selected SD file '" + name + "' now?");
+        const name = (sdSelectedName && sdSelectedName.value) ? sdSelectedName.value.trim() : "";
+        if (!name) {{
+          window.alert("Enter an exact SD filename first.");
+          updateActionButtons();
+          return;
+        }}
+        const ok = window.confirm("Upload exact SD file '" + name + "' now?");
         if (!ok) return;
         const opId = "op_" + Date.now().toString() + "_" + Math.floor(Math.random() * 100000).toString();
         if (sdUploadOpId) sdUploadOpId.value = opId;
@@ -4796,7 +4814,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_html(render_file_transfers_page(message="Selected Arduino has no IP address.", selected_uid=selected_uid))
                 return True
             if not remote_filename:
-                self._send_html(render_file_transfers_page(message="Select a file from SD list first.", selected_uid=selected_uid))
+                self._send_html(render_file_transfers_page(message="Enter an exact SD filename first.", selected_uid=selected_uid))
                 return True
             ok_gate, reason = can_web_access_file_transfers(selected_uid, "Upload selected SD file")
             if not ok_gate:
