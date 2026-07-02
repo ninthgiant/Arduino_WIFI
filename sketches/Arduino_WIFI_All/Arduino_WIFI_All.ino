@@ -30,8 +30,8 @@
 // Select exactly one WiFi hardware profile before compiling.
 // Default is the current Uno R4 WiFi onboard ESP32-S3 radio.
 
-#define WIFI_PROFILE_R4_WIFI 1 // this is the R4 WIFI setup - change version string below. This worked on S74C with tacuna board
-// #define WIFI_PROFILE_AIRLIFT 1
+// #define WIFI_PROFILE_R4_WIFI 1 // this is the R4 WIFI setup - change version string below. This worked on S74C with tacuna board
+#define WIFI_PROFILE_AIRLIFT 1
 
 #if defined(WIFI_PROFILE_R4_WIFI) && defined(WIFI_PROFILE_AIRLIFT)
 #error "Select only one WiFi profile: WIFI_PROFILE_R4_WIFI or WIFI_PROFILE_AIRLIFT"
