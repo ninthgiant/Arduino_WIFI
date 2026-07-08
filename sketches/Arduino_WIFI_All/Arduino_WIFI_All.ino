@@ -161,7 +161,7 @@ const long RTC_NTP_LOCAL_OFFSET_SECONDS = -3L * 3600L;  // Align with controller
 
 // Time window for WiFi phase (hours in local controller time). Default will be 7 and 19. Currently changed for testing during the day
 uint8_t START_HOUR = 8;    // testing using 1 hr window. Return to 8 to 17 for deployment and keeping wifi to min
-uint8_t END_HOUR = 17;
+uint8_t END_HOUR = 20;
 // TCP chunk size used for file transfer to controller.
 // WiFiNINA/AirLift is more reliable with smaller chunks; R4 WiFi can use larger chunks.
 #if defined(WIFI_PROFILE_AIRLIFT)
@@ -194,6 +194,14 @@ const float TRIM_DEBOUNCE_SECONDS = 0.5f;
 const uint32_t TRIM_PROGRESS_ROWS = 50000UL;
 // Maximum merged keep-intervals stored in RAM for trim pass.
 const int MAX_TRIM_INTERVALS = 128;
+// Calibration threshold detection buckets. The timestamp may be reused for many
+// rows, so use sample-count buckets rather than Unix-second buckets.
+const uint16_t TRIM_CAL_BUCKET_SAMPLES = 60;
+const uint16_t TRIM_CAL_BUCKET_MIN_SAMPLES = 30;
+const float TRIM_CAL_BASELINE_LOWEST_FRACTION = 0.20f;
+const float TRIM_CAL_STEADY_SD_MULTIPLIER = 4.0f;
+const float TRIM_CAL_BASELINE_SEPARATION_SD = 8.0f;
+const int TRIM_CAL_BASELINE_BUCKET_MAX = 160;
 // Require this many seconds continuously outside the WiFi window before leaving WiFi mode.
 const uint32_t WIFI_EXIT_DEBOUNCE_SECONDS = 120UL;
 // WiFi-window low-power behavior.
@@ -243,13 +251,13 @@ const bool debug = false;
 const bool countdown = true;
 // show which build we are making
 #if defined(WIFI_PROFILE_AIRLIFT) && BSM_SENSOR_HOOK_ENABLED
-const char VERSION[] = "4.4ctd";
+const char VERSION[] = "4.5ctd";
 #elif defined(WIFI_PROFILE_AIRLIFT)
-const char VERSION[] = "4.4ctp";
+const char VERSION[] = "4.5ctp";
 #elif defined(WIFI_PROFILE_R4_WIFI) && BSM_SENSOR_HOOK_ENABLED
-const char VERSION[] = "4.4cwd";
+const char VERSION[] = "4.5cwd";
 #else
-const char VERSION[] = "4.4cwp";
+const char VERSION[] = "4.5cwp";
 #endif
 
 
@@ -1143,6 +1151,8 @@ CalibrationThresholds deriveCalibrationThresholdsFromFile(const String &inputNam
   long calMin = 0;
   long calMax = 0;
   uint32_t firstTs = 0;
+  uint32_t bucketCount = 0;
+  uint16_t bucketN = 0;
 
   while (readDataLine(in, line, sizeof(line))) {
     if (!parseDataCsvLine(line, value, ts)) continue;
@@ -1155,84 +1165,154 @@ CalibrationThresholds deriveCalibrationThresholdsFromFile(const String &inputNam
     if (ts > firstTs + TRIM_CALIBRATION_SECONDS) break;
     if (value < calMin) calMin = value;
     if (value > calMax) calMax = value;
+    bucketN++;
+    if (bucketN >= TRIM_CAL_BUCKET_SAMPLES) {
+      bucketCount++;
+      bucketN = 0;
+    }
   }
+  if (bucketN >= TRIM_CAL_BUCKET_MIN_SAMPLES) bucketCount++;
   in.close();
   if (!haveFirst) return r;
+  if (bucketCount == 0) return r;
 
-  long split = calMin + (long) ((float) (calMax - calMin) * TRIM_CAL_SPLIT_FRACTION);
-  if (split < calMin + TRIM_TRIGGER_MIN_DELTA) split = calMin + TRIM_TRIGGER_MIN_DELTA;
+  uint16_t baselineKeep = (uint16_t) ((float) bucketCount * TRIM_CAL_BASELINE_LOWEST_FRACTION);
+  if (baselineKeep < 3) baselineKeep = 3;
+  if (baselineKeep > TRIM_CAL_BASELINE_BUCKET_MAX) baselineKeep = TRIM_CAL_BASELINE_BUCKET_MAX;
 
   in = SD.open(inputName.c_str(), FILE_READ);
   if (!in) return r;
 
-  double baselineMean = 0.0;
-  uint32_t baselineN = 0;
-  bool inSeg = false;
-  long segVals[1200];
-  int segValsN = 0;
-  long lowMean = LONG_MAX;
+  long lowMeans[TRIM_CAL_BASELINE_BUCKET_MAX];
+  float lowSds[TRIM_CAL_BASELINE_BUCKET_MAX];
+  uint16_t lowCount = 0;
+  bucketN = 0;
+  double bucketMean = 0.0;
+  double bucketM2 = 0.0;
+
+  auto finishBaselineBucket = [&]() {
+    if (bucketN < TRIM_CAL_BUCKET_MIN_SAMPLES) {
+      bucketN = 0;
+      bucketMean = 0.0;
+      bucketM2 = 0.0;
+      return;
+    }
+
+    long m = (long) bucketMean;
+    float sd = (bucketN > 1) ? (float) sqrt(bucketM2 / (double) (bucketN - 1)) : 0.0f;
+    if (lowCount < baselineKeep) {
+      lowMeans[lowCount] = m;
+      lowSds[lowCount] = sd;
+      lowCount++;
+    } else {
+      uint16_t maxIdx = 0;
+      for (uint16_t i = 1; i < lowCount; i++) {
+        if (lowMeans[i] > lowMeans[maxIdx]) maxIdx = i;
+      }
+      if (m < lowMeans[maxIdx]) {
+        lowMeans[maxIdx] = m;
+        lowSds[maxIdx] = sd;
+      }
+    }
+
+    bucketN = 0;
+    bucketMean = 0.0;
+    bucketM2 = 0.0;
+  };
 
   while (readDataLine(in, line, sizeof(line))) {
     if (!parseDataCsvLine(line, value, ts)) continue;
     if (ts > firstTs + TRIM_CALIBRATION_SECONDS) break;
 
-    if (value <= split) {
-      baselineN++;
-      double delta = (double) value - baselineMean;
-      baselineMean += delta / (double) baselineN;
-    }
-
-    bool elevated = (value > split);
-    if (elevated) {
-      if (!inSeg) {
-        inSeg = true;
-        segValsN = 0;
-      }
-      if (segValsN < (int) (sizeof(segVals) / sizeof(segVals[0]))) {
-        segVals[segValsN++] = value;
-      }
-    } else if (inSeg) {
-      if (segValsN >= 20) {
-        int s = (int) (0.30f * (float) segValsN);
-        int e = (int) (0.70f * (float) segValsN);
-        if (e <= s) e = s + 1;
-        long long sum = 0;
-        int n = 0;
-        for (int i = s; i < e && i < segValsN; i++) {
-          sum += segVals[i];
-          n++;
-        }
-        if (n > 0) {
-          long m = (long) (sum / n);
-          if (m < lowMean) lowMean = m;
-        }
-      }
-      inSeg = false;
-      segValsN = 0;
-    }
+    bucketN++;
+    double delta = (double) value - bucketMean;
+    bucketMean += delta / (double) bucketN;
+    bucketM2 += delta * ((double) value - bucketMean);
+    if (bucketN >= TRIM_CAL_BUCKET_SAMPLES) finishBaselineBucket();
   }
-  if (inSeg && segValsN >= 20) {
-    int s = (int) (0.30f * (float) segValsN);
-    int e = (int) (0.70f * (float) segValsN);
-    if (e <= s) e = s + 1;
-    long long sum = 0;
-    int n = 0;
-    for (int i = s; i < e && i < segValsN; i++) {
-      sum += segVals[i];
-      n++;
-    }
-    if (n > 0) {
-      long m = (long) (sum / n);
-      if (m < lowMean) lowMean = m;
-    }
-  }
+  finishBaselineBucket();
   in.close();
 
-  if (baselineN < 10) return r;
-  long baseline = (long) baselineMean;
-  if (lowMean == LONG_MAX || lowMean <= baseline + TRIM_TRIGGER_MIN_DELTA) {
-    lowMean = baseline + TRIM_TRIGGER_MIN_DELTA;
+  if (lowCount < 2) return r;
+
+  for (uint16_t i = 0; i + 1 < lowCount; i++) {
+    for (uint16_t j = i + 1; j < lowCount; j++) {
+      if (lowMeans[j] < lowMeans[i]) {
+        long tm = lowMeans[i];
+        lowMeans[i] = lowMeans[j];
+        lowMeans[j] = tm;
+        float tsd = lowSds[i];
+        lowSds[i] = lowSds[j];
+        lowSds[j] = tsd;
+      }
+    }
   }
+
+  long baseline = lowMeans[lowCount / 2];
+  if ((lowCount % 2) == 0 && lowCount >= 2) {
+    baseline = (long) (((long long) lowMeans[(lowCount / 2) - 1] + (long long) lowMeans[lowCount / 2]) / 2LL);
+  }
+  for (uint16_t i = 0; i + 1 < lowCount; i++) {
+    for (uint16_t j = i + 1; j < lowCount; j++) {
+      if (lowSds[j] < lowSds[i]) {
+        float tsd = lowSds[i];
+        lowSds[i] = lowSds[j];
+        lowSds[j] = tsd;
+      }
+    }
+  }
+
+  float baselineSd = lowSds[lowCount / 2];
+  if ((lowCount % 2) == 0 && lowCount >= 2) {
+    baselineSd = (lowSds[(lowCount / 2) - 1] + lowSds[lowCount / 2]) / 2.0f;
+  }
+  if (baselineSd <= 0.0f) baselineSd = 1.0f;
+  float steadySdLimit = baselineSd * TRIM_CAL_STEADY_SD_MULTIPLIER;
+  if (steadySdLimit < baselineSd + 1.0f) steadySdLimit = baselineSd + 1.0f;
+  double aboveBaselineMin = (double) baseline + (double) baselineSd * (double) TRIM_CAL_BASELINE_SEPARATION_SD;
+  if (aboveBaselineMin < (double) baseline + 1.0) aboveBaselineMin = (double) baseline + 1.0;
+
+  in = SD.open(inputName.c_str(), FILE_READ);
+  if (!in) return r;
+
+  long lowMean = LONG_MAX;
+  bucketN = 0;
+  bucketMean = 0.0;
+  bucketM2 = 0.0;
+
+  auto finishLowBucket = [&]() {
+    if (bucketN < TRIM_CAL_BUCKET_MIN_SAMPLES) {
+      bucketN = 0;
+      bucketMean = 0.0;
+      bucketM2 = 0.0;
+      return;
+    }
+
+    long m = (long) bucketMean;
+    float sd = (bucketN > 1) ? (float) sqrt(bucketM2 / (double) (bucketN - 1)) : 0.0f;
+    if (sd <= steadySdLimit && (double) m > aboveBaselineMin && m < lowMean) {
+      lowMean = m;
+    }
+
+    bucketN = 0;
+    bucketMean = 0.0;
+    bucketM2 = 0.0;
+  };
+
+  while (readDataLine(in, line, sizeof(line))) {
+    if (!parseDataCsvLine(line, value, ts)) continue;
+    if (ts > firstTs + TRIM_CALIBRATION_SECONDS) break;
+
+    bucketN++;
+    double delta = (double) value - bucketMean;
+    bucketMean += delta / (double) bucketN;
+    bucketM2 += delta * ((double) value - bucketMean);
+    if (bucketN >= TRIM_CAL_BUCKET_SAMPLES) finishLowBucket();
+  }
+  finishLowBucket();
+  in.close();
+
+  if (lowMean == LONG_MAX || lowMean < calMin || lowMean > calMax) return r;
 
   r.ok = true;
   r.firstTs = firstTs;
