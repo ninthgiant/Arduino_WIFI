@@ -107,6 +107,9 @@ bool wifiLowPowerStandby = false;
 uint32_t wifiLastActivityTs = 0;
 uint32_t wifiNextStandbyProbeTs = 0;
 bool wifiCommandHandled = false;
+uint32_t nextWifiConnectAttemptTs = 0;
+uint8_t wifiConnectFailedAttempts = 0;
+bool wifiConnectGiveUpThisWindow = false;
 uint8_t wifiPolicy = 0;
 uint16_t wifiPolicyGraceMinutes = 60;
 uint8_t wifiPolicyWakeHour = 16;
@@ -160,8 +163,8 @@ const uint16_t RTC_NTP_RETRY_DELAY_MS = 500;
 const long RTC_NTP_LOCAL_OFFSET_SECONDS = -3L * 3600L;  // Align with controller local offset (UTC-3h).
 
 // Time window for WiFi phase (hours in local controller time). Default will be 7 and 19. Currently changed for testing during the day
-uint8_t START_HOUR = 8;    // testing using 1 hr window. Return to 8 to 17 for deployment and keeping wifi to min
-uint8_t END_HOUR = 20;
+uint8_t START_HOUR = 6; // 12; //8;    // testing using 1 hr window. Return to 8 to 17 for deployment and keeping wifi to min
+uint8_t END_HOUR = 19; // 14; //19;
 // TCP chunk size used for file transfer to controller.
 // WiFiNINA/AirLift is more reliable with smaller chunks; R4 WiFi can use larger chunks.
 #if defined(WIFI_PROFILE_AIRLIFT)
@@ -211,6 +214,9 @@ const bool WIFI_STANDBY_ENABLED = true;
 const uint8_t WIFI_POLICY_STAY_ACTIVE = 0;
 const uint8_t WIFI_POLICY_MORNING_ONLY = 1;
 const uint32_t WIFI_STANDBY_CHECK_INTERVAL_SECONDS = 30UL;
+const uint32_t WIFI_CONNECT_TOTAL_TIMEOUT_MS = 120000UL;
+const uint32_t WIFI_CONNECT_RETRY_INTERVAL_SECONDS = 600UL;
+const uint8_t WIFI_CONNECT_MAX_FAILED_ATTEMPTS = 6;
 const uint32_t READY_BEACON_INTERVAL_MS = 45000UL;
 const uint32_t READY_BEACON_JITTER_MS = 10000UL;
 // Raw file selection policy for trim phase.
@@ -238,8 +244,8 @@ const bool printLCD = true;
 // LCD refresh cadence during startup calibration acquisition phase.
 const uint32_t LCD_CAL_UPDATE_INTERVAL_MS = 1000UL;
 // LCD refresh cadence during normal acquisition phase.
-// Set to 0 to disable periodic normal-run sample display updates.
-const uint32_t LCD_RUN_UPDATE_INTERVAL_MS = 30000UL;
+// Set to 0 to disable periodic normal-run sample display updates. For now, every 5 seconds is a good compromise between visibility and pause spikes.
+const uint32_t LCD_RUN_UPDATE_INTERVAL_MS = 5000UL;
 // Acquisition write batching: keep chunk small to reduce pause spikes.
 const uint16_t ACQ_LINES_PER_CHUNK = 12;
 const uint32_t ACQ_FLUSH_INTERVAL_MS = 5000UL;
@@ -251,13 +257,13 @@ const bool debug = false;
 const bool countdown = true;
 // show which build we are making
 #if defined(WIFI_PROFILE_AIRLIFT) && BSM_SENSOR_HOOK_ENABLED
-const char VERSION[] = "4.5ctd";
+const char VERSION[] = "4.6ctd";
 #elif defined(WIFI_PROFILE_AIRLIFT)
-const char VERSION[] = "4.5ctp";
+const char VERSION[] = "4.6ctp";
 #elif defined(WIFI_PROFILE_R4_WIFI) && BSM_SENSOR_HOOK_ENABLED
-const char VERSION[] = "4.5cwd";
+const char VERSION[] = "4.6cwd";
 #else
-const char VERSION[] = "4.5cwp";
+const char VERSION[] = "4.6cwp";
 #endif
 
 
@@ -340,6 +346,39 @@ bool wifiPolicyWakeTimeReached(uint32_t unixTs) {
 
 uint32_t wifiPolicyGraceSeconds() {
   return (uint32_t)wifiPolicyGraceMinutes * 60UL;
+}
+
+void resetWifiConnectRetryState() {
+  nextWifiConnectAttemptTs = 0;
+  wifiConnectFailedAttempts = 0;
+  wifiConnectGiveUpThisWindow = false;
+}
+
+bool canAttemptWifiConnect(uint32_t unixTs) {
+  if (wifiConnectGiveUpThisWindow) return false;
+  if (nextWifiConnectAttemptTs == 0) return true;
+  return unixTs >= nextWifiConnectAttemptTs;
+}
+
+void noteWifiConnectFailure(uint32_t unixTs) {
+  if (wifiConnectFailedAttempts < 255) wifiConnectFailedAttempts++;
+  Serial.print(F("WiFi connect failed attempt "));
+  Serial.print(wifiConnectFailedAttempts);
+  Serial.print(F("/"));
+  Serial.println(WIFI_CONNECT_MAX_FAILED_ATTEMPTS);
+
+  if (wifiConnectFailedAttempts >= WIFI_CONNECT_MAX_FAILED_ATTEMPTS) {
+    wifiConnectGiveUpThisWindow = true;
+    nextWifiConnectAttemptTs = 0;
+    Serial.println(F("WiFi connect attempts exhausted for this window."));
+    if (printLCD) setLcdStatusLine1("WiFi: give up");
+    return;
+  }
+
+  nextWifiConnectAttemptTs = unixTs + WIFI_CONNECT_RETRY_INTERVAL_SECONDS;
+  Serial.print(F("Next WiFi connect attempt at unix "));
+  Serial.println((unsigned long)nextWifiConnectAttemptTs);
+  if (printLCD) setLcdStatusLine1("WiFi: retry wait");
 }
 
 /***********************
@@ -1736,8 +1775,15 @@ bool connectWiFi() {
   // Set hostname before WiFi.begin() so controller lists device consistently.
   WiFi.setHostname(networkHostname.c_str());
   delay(1000); // Short delay to ensure hostname is set before connection attempts
-  
+
+  unsigned long connectStart = millis();
   while (status != WL_CONNECTED) {
+    if ((uint32_t)(millis() - connectStart) >= WIFI_CONNECT_TOTAL_TIMEOUT_MS) {
+      Serial.println(F("WiFi connect timeout."));
+      WiFi.disconnect();
+      return false;
+    }
+
     if (strlen(SECRET_PASS) == 0) {
       status = WiFi.begin(SECRET_SSID);
     } else {
@@ -1757,6 +1803,11 @@ bool connectWiFi() {
   unsigned long ipWaitStart = millis();
   while (WiFi.localIP() == IPAddress(0, 0, 0, 0) && (millis() - ipWaitStart) < 10000UL) {
     delay(100);
+  }
+  if (WiFi.localIP() == IPAddress(0, 0, 0, 0)) {
+    Serial.println(F("WiFi connect failed: no DHCP address."));
+    WiFi.disconnect();
+    return false;
   }
 
   Serial.print(F("WiFi connected. Local IP: "));
@@ -3088,6 +3139,7 @@ void loop() {
       readyUploadFilename = "";
       nextReadyBeaconMs = 0;
       readyBeaconSendCount = 0;
+      resetWifiConnectRetryState();
       Write_Estimated_Time_To_RTC("wifi-window-entry");
       Serial.println(F("WiFi window entered: reboot/calibration required for this window."));
     }
@@ -3107,6 +3159,7 @@ void loop() {
     readyUploadFilename = "";
     nextReadyBeaconMs = 0;
     readyBeaconSendCount = 0;
+    resetWifiConnectRetryState();
     Serial.println(F("WiFi window exited: reboot gate reset for next window."));
   }
 
@@ -3176,18 +3229,29 @@ void loop() {
         delay(250);
         return;
       }
+      if (!canAttemptWifiConnect(unixTs)) {
+        delay(250);
+        return;
+      }
       Serial.println(F("WiFi policy wake hour reached"));
       enterWifiMode();
       wifiModeActive = wifiInitialized;
       if (!wifiModeActive) {
-        wifiNextStandbyProbeTs = unixTs + WIFI_STANDBY_CHECK_INTERVAL_SECONDS;
+        noteWifiConnectFailure(unixTs);
+        wifiNextStandbyProbeTs = unixTs + WIFI_CONNECT_RETRY_INTERVAL_SECONDS;
         delay(250);
         return;
       }
+      resetWifiConnectRetryState();
       Serial.println(F("WiFi standby wake -> active"));
       wifiLowPowerStandby = false;
       wifiOutWindowSinceTs = 0;
       wifiLastActivityTs = unixTs;
+      return;
+    }
+
+    if (!canAttemptWifiConnect(unixTs)) {
+      delay(250);
       return;
     }
 
@@ -3199,6 +3263,7 @@ void loop() {
     enterWifiMode();
     wifiModeActive = wifiInitialized;
     if (wifiModeActive) {
+      resetWifiConnectRetryState();
       // Keep session armed for the rest of the current WiFi window so
       // additional WiFi activity can continue without another reboot.
       wifiIdleAnnounced = false;
@@ -3210,6 +3275,8 @@ void loop() {
       readyUploadFilename = determineReadyUploadFilename();
       nextReadyBeaconMs = 0;
       readyBeaconSendCount = 0;
+    } else {
+      noteWifiConnectFailure(unixTs);
     }
     return;
   }
