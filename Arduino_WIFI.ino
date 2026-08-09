@@ -26,7 +26,7 @@
 #include <SD.h>
 #include <SPI.h>
 #include <Wire.h>
-#include <WiFiS3.h>
+#include <WiFiNINA.h>  // AirLift Shield port (was WiFiS3 for onboard ESP32-S3)
 #include <WiFiUdp.h>
 #include <limits.h>
 #include "Time.h"
@@ -39,8 +39,19 @@ String myFilename;
 
 // PCB variable defined by Tacuna code
 #define SRAM_CS 1 //Use A0 for Uno R3.  Use 1 for Uno R4
-#define SD_CS 10
+#define SD_CS 10  // Bob's original wiring (HiLetgo SD module wired CS -> D10)
 #define AD7193_CS 0 //Use A1 for Uno R3. Use 0 for Uno R4
+
+// AirLift Shield (#4285) pin map for WiFiNINA.
+// Shares SPI bus (D11/D12/D13 + ICSP) with SD card and AD7193; different CS pins keep them separable.
+// HARDWARE MODS REQUIRED on AirLift Shield (D5 and D10 conflict with the mauck stack):
+//   1. RESET: cut RST_JMP D5 trace, jumper A0 (D14) -> ESP32 EN  -- D5 conflicts with LCD data 4
+//   2. CS:    cut CS_JMP D10 trace, jumper A1 (D15) -> ESP32 GPIO5 (SPI CS) -- D10 conflicts with SD CS
+// NOTE: A4/A5 are NOT safe — they are taken over by Wire.begin() (I2C SDA/SCL) for the RTC.
+#define AIRLIFT_CS    15   // A1
+#define AIRLIFT_BUSY   7
+#define AIRLIFT_RESET 14   // A0
+#define AIRLIFT_GPIO0 -1   // G0 jumper open; ESP32 boots from flash via on-shield pull-up
 
 // Handle the ADC PCB unit
 // PRDC_AD7193 AD7193;
@@ -1831,6 +1842,9 @@ void sendFileOverTcp(
 void serviceWifiCommands() {
   wifiCommandHandled = false;
   if (!wifiInitialized) return;
+  // WiFiNINA quirk: parsePacket() drops packets if called too rapidly on AirLift.
+  // 10ms idle gap fixes the missed-packet behavior.
+  delay(10);
   int packetSize = udp.parsePacket();
   if (packetSize <= 0) return;
 
@@ -2326,12 +2340,19 @@ void setup() {
   pinMode(SD_CS, OUTPUT); 
   digitalWrite(SD_CS, HIGH);
 
-  pinMode(AD7193_CS, OUTPUT); 
+  pinMode(AD7193_CS, OUTPUT);
   digitalWrite(AD7193_CS, HIGH);
+
+  pinMode(AIRLIFT_CS, OUTPUT);
+  digitalWrite(AIRLIFT_CS, HIGH);
 
   // Communication settings
   Serial.begin(115200);
   delay(500); // give time for serial to start up
+
+  // AirLift Shield pin configuration. Must be set before any WiFi.* call.
+  WiFi.setPins(AIRLIFT_CS, AIRLIFT_BUSY, AIRLIFT_RESET, AIRLIFT_GPIO0);
+
   Serial.println("setup lcd");
   deviceId = getChipIdHex();
   deviceID_6 = shortUidFromHash(deviceId, 6);
