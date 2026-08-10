@@ -37,6 +37,8 @@
 #error "Select only one WiFi profile: WIFI_PROFILE_R4_WIFI or WIFI_PROFILE_AIRLIFT"
 #elif defined(WIFI_PROFILE_AIRLIFT)
 #include <WiFiNINA.h>
+#include "ESPSerialFlasher.h"   // self-heal: reflash nina-fw from SD if AirLift is dead
+#include "esp_loader.h"         // register-level access for sentinel-gated efuse burn
 #elif defined(WIFI_PROFILE_R4_WIFI)
 #include <WiFiS3.h>
 #else
@@ -67,6 +69,27 @@ String myFilename;
 #define AIRLIFT_BUSY   7
 #define AIRLIFT_RESET 14   // A0
 #define AIRLIFT_GPIO0 -1   // G0 jumper open
+
+// AirLift auto-recovery: on boot, probe nina-fw via WiFi.firmwareVersion().
+// If the AirLift is unresponsive, reflash from SD root file NINA_FW_FILENAME
+// (8.3 filename — the SD library on Renesas doesn't do long names) and
+// hardware-reset. Set WIFI_AUTO_RECOVERY to 0 to disable.
+//
+// No retry counter and no per-recovery state on the SD: the fleet
+// provisioning workflow is one Arduino + one SD card cycled through
+// many AirLift shields, so any SD-persistent counter would carry
+// stale state from a prior board into a fresh one. If the chip is
+// genuinely unrecoverable the sketch will loop on power-up reflash;
+// the operator watches and pulls power.
+#define WIFI_AUTO_RECOVERY 1
+#define NINA_FW_FILENAME   "NINAFW.BIN"
+
+// Efuse burn fires during recovery when (a) ESPFlasher syncs to the
+// chip and (b) the chip's live efuse read shows XPD_SDIO_{REG,FORCE,
+// TIEH} unset. Source of truth is the chip itself read live every
+// boot — no SD marker, so one SD card can provision many boards.
+// Set WIFI_AUTO_EFUSE_BURN to 0 to disable the burn path entirely.
+#define WIFI_AUTO_EFUSE_BURN  1
 #endif
 
 // Handle the ADC PCB unit
@@ -1755,6 +1778,247 @@ bool ensureTrimmedFileReadyForWifi() {
   return true;
 }
 
+#if defined(WIFI_PROFILE_AIRLIFT)
+// ----- AirLift auto-recovery (AirLift-only) ----------------------------------
+// One-time cleanup of legacy SD-persistent state from earlier versions
+// of this sketch. We no longer use RECOVCNT.TXT (retry counter) or EFUSE.DN
+// (burn marker), and leaving them on the card causes stale-state confusion
+// when one provisioning SD is moved across many boards. Removing them on
+// every recovery boot is cheap (single SD.exists+SD.remove) and idempotent.
+static void cleanLegacyRecoveryStateFiles() {
+  if (SD.exists("RECOVCNT.TXT")) {
+    SD.remove("RECOVCNT.TXT");
+    Serial.println(F("[wifi] removed legacy RECOVCNT.TXT"));
+  }
+  if (SD.exists("EFUSE.DN")) {
+    SD.remove("EFUSE.DN");
+    Serial.println(F("[wifi] removed legacy EFUSE.DN"));
+  }
+}
+
+#if WIFI_AUTO_EFUSE_BURN
+// ESP32 EFUSE_BLK0 registers and the three VDD_SDIO bits we burn.
+// Espressif factory-burns these on production WROOM modules; raw modules
+// don't have them set, so flash voltage gets decided by the IO12 strap.
+// Adafruit AirLifts don't pull IO12, so unburned chips boot ROM but the app
+// won't run. Burning these three bits permanently overrides the strap to 3.3V.
+#define EFUSE_BASE          0x3FF5A000
+#define EFUSE_BLK0_RDATA4   (EFUSE_BASE + 0x10)
+#define EFUSE_BLK0_WDATA4   (EFUSE_BASE + 0x2C)
+#define EFUSE_CONF_REG      (EFUSE_BASE + 0xFC)
+#define EFUSE_CMD_REG       (EFUSE_BASE + 0x104)
+#define EFUSE_CONF_WRITE    0x5A5A
+#define EFUSE_CONF_READ     0x5AA5
+#define EFUSE_CMD_PGM       0x02
+#define EFUSE_CMD_READ      0x01
+#define BIT_XPD_SDIO_REG     14
+#define BIT_XPD_SDIO_TIEH    15
+#define BIT_XPD_SDIO_FORCE   16
+
+static bool waitEfuseCmdClear(uint32_t cmdBit, uint32_t timeoutMs) {
+  uint32_t t0 = millis();
+  while (millis() - t0 < timeoutMs) {
+    uint32_t v = 0;
+    if (esp_loader_read_register(EFUSE_CMD_REG, &v) != ESP_LOADER_SUCCESS) return false;
+    if ((v & cmdBit) == 0) return true;
+    delay(5);
+  }
+  return false;
+}
+
+// Returns true only when bits were actually burned this call (caller should
+// reset to re-latch the flash voltage strap). Returns false on:
+//   * chip already has all 3 bits set (no-op, returns false)
+//   * connect / read / verify failure (safe to retry on next power cycle)
+//
+// No SD state is read or written — source of truth is the chip's actual
+// efuse state read live every boot, which makes the same SD card usable
+// across many boards without operator intervention.
+static bool maybeBurnEfuse() {
+  Serial.println(F("[efuse] checking chip state before flash"));
+  if (printLCD) {
+    lcd.setCursor(0, 0); lcd.print("Efuse check...  ");
+    lcd.setCursor(0, 1); lcd.print("                ");
+  }
+
+  ESPFlasherInit(true, &Serial);
+  if (ESPFlasherConnect() != ESP_LOADER_SUCCESS) {
+    Serial.println(F("[efuse] flasher connect failed - skip burn"));
+    if (printLCD) { lcd.setCursor(0, 1); lcd.print("Connect FAIL    "); }
+    delay(2000);
+    return false;
+  }
+
+  uint32_t rdata4 = 0;
+  if (esp_loader_read_register(EFUSE_BLK0_RDATA4, &rdata4) != ESP_LOADER_SUCCESS) {
+    Serial.println(F("[efuse] RDATA4 read failed - skip burn"));
+    if (printLCD) { lcd.setCursor(0, 1); lcd.print("Read FAIL       "); }
+    delay(2000);
+    return false;
+  }
+
+  const uint32_t wantMask = (1U << BIT_XPD_SDIO_REG)
+                          | (1U << BIT_XPD_SDIO_FORCE)
+                          | (1U << BIT_XPD_SDIO_TIEH);
+  uint32_t toBurn = wantMask & ~rdata4;
+
+  Serial.print(F("[efuse] RDATA4=0x")); Serial.print(rdata4, HEX);
+  Serial.print(F(" toBurn=0x")); Serial.println(toBurn, HEX);
+
+  if (toBurn == 0) {
+    Serial.println(F("[efuse] already burned - no-op"));
+    if (printLCD) { lcd.setCursor(0, 1); lcd.print("Already burned  "); }
+    delay(1500);
+    return false;
+  }
+
+  if (printLCD) {
+    lcd.setCursor(0, 0); lcd.print("Efuse burn...   ");
+    lcd.setCursor(0, 1); lcd.print("Do NOT power off");
+  }
+  Serial.println(F("[efuse] burning XPD_SDIO bits"));
+
+  bool seqOk =
+      esp_loader_write_register(EFUSE_BLK0_WDATA4, toBurn)        == ESP_LOADER_SUCCESS
+   && esp_loader_write_register(EFUSE_CONF_REG, EFUSE_CONF_WRITE) == ESP_LOADER_SUCCESS
+   && esp_loader_write_register(EFUSE_CMD_REG, EFUSE_CMD_PGM)     == ESP_LOADER_SUCCESS
+   && waitEfuseCmdClear(EFUSE_CMD_PGM, 2000)
+   && esp_loader_write_register(EFUSE_CONF_REG, EFUSE_CONF_READ)  == ESP_LOADER_SUCCESS
+   && esp_loader_write_register(EFUSE_CMD_REG, EFUSE_CMD_READ)    == ESP_LOADER_SUCCESS
+   && waitEfuseCmdClear(EFUSE_CMD_READ, 2000);
+
+  if (!seqOk) {
+    Serial.println(F("[efuse] burn sequence failed"));
+    if (printLCD) { lcd.setCursor(0, 0); lcd.print("Efuse FAIL      "); }
+    delay(2000);
+    return false;
+  }
+
+  uint32_t after = 0;
+  if (esp_loader_read_register(EFUSE_BLK0_RDATA4, &after) != ESP_LOADER_SUCCESS
+      || (after & wantMask) != wantMask) {
+    Serial.print(F("[efuse] verify failed: after=0x")); Serial.println(after, HEX);
+    if (printLCD) { lcd.setCursor(0, 0); lcd.print("Efuse VERIFY    "); }
+    delay(2000);
+    return false;
+  }
+
+  Serial.print(F("[efuse] burn verified: after=0x")); Serial.println(after, HEX);
+  if (printLCD) {
+    lcd.setCursor(0, 0); lcd.print("Efuse OK        ");
+    lcd.setCursor(0, 1); lcd.print("Rebooting...    ");
+  }
+  delay(2000);
+  return true;
+}
+#endif // WIFI_AUTO_EFUSE_BURN
+
+/***********************
+ * Probes the AirLift WiFi module. If WiFi.firmwareVersion() doesn't return a
+ * sane string, attempts to reflash nina-fw from the SD card (NINAFW.BIN in the
+ * root) and hardware-resets the R4 so the new firmware boots cleanly.
+ *
+ * Preconditions: WiFi.setPins() called; SD already initialised (sdReady set).
+ * Behaviour when WiFi is dead:
+ *   - SD not ready / NINAFW.BIN missing -> warns and returns.
+ *   - Otherwise: live efuse read (burn if needed), then flash (MD5-verified
+ *     internally), then NVIC reset. No retry counter; if the chip is genuinely
+ *     unrecoverable the unit boot-loops until the operator pulls power.
+ ***********************/
+void checkAndMaybeFlashWiFi() {
+#if WIFI_AUTO_RECOVERY
+  if (printLCD) {
+    lcd.setCursor(0, 0); lcd.print("WiFi check...   ");
+    lcd.setCursor(0, 1); lcd.print("                ");
+  }
+  Serial.println(F("[wifi] checking AirLift firmware..."));
+  String fw = WiFi.firmwareVersion();
+  bool fwOk = (fw.length() >= 5) && (fw[0] != (char)0xFF) && (fw[0] != 0);
+  if (fwOk) {
+    Serial.print(F("[wifi] firmware OK: "));
+    Serial.println(fw);
+    if (printLCD) {
+      lcd.setCursor(0, 0);
+      lcd.print("WiFi fw: ");
+      lcd.print(fw.substring(0, 7));
+    }
+    delay(800);
+    return;
+  }
+  Serial.println(F("[wifi] firmware unreadable - reflash needed"));
+  if (printLCD) {
+    lcd.setCursor(0, 0); lcd.print("WiFi DEAD       ");
+  }
+  delay(800);
+  if (!sdReady) {
+    Serial.println(F("[wifi] sdReady=false; trying SD.begin for recovery"));
+    sdReady = SD.begin(SD_CS);
+  }
+  if (!sdReady) {
+    Serial.println(F("[wifi] no SD - cannot auto-flash"));
+    if (printLCD) { lcd.setCursor(0, 1); lcd.print("No SD - manual  "); }
+    delay(3000);
+    return;
+  }
+  if (!SD.exists(NINA_FW_FILENAME)) {
+    Serial.print(F("[wifi] "));
+    Serial.print(NINA_FW_FILENAME);
+    Serial.println(F(" not found on SD"));
+    if (printLCD) { lcd.setCursor(0, 1); lcd.print("NINAFW.BIN n/f  "); }
+    delay(3000);
+    return;
+  }
+  cleanLegacyRecoveryStateFiles();
+#if WIFI_AUTO_EFUSE_BURN
+  // Live efuse read + burn-if-needed runs before the flash attempt. If a
+  // burn fires, NVIC reset is required to re-latch the flash voltage strap;
+  // the next boot's recovery flow will reflash nina-fw under correct voltage.
+  if (maybeBurnEfuse()) {
+    Serial.println(F("[efuse] burn done; resetting to apply strap"));
+    delay(500);
+    NVIC_SystemReset();
+  }
+#endif
+  if (printLCD) {
+    lcd.setCursor(0, 0); lcd.print("Flashing nina-fw");
+    lcd.setCursor(0, 1); lcd.print("Do NOT power off");
+  }
+  Serial.println(F("[wifi] starting flash from SD..."));
+  ESPFlasherInit(true, &Serial);
+  esp_loader_error_t cerr = ESPFlasherConnect();
+  if (cerr != ESP_LOADER_SUCCESS) {
+    Serial.print(F("[wifi] ESPFlasherConnect failed: "));
+    Serial.println(cerr);
+    if (printLCD) {
+      lcd.setCursor(0, 0); lcd.print("Flash connect   ");
+      lcd.setCursor(0, 1); lcd.print("FAIL e="); lcd.print(cerr); lcd.print("        ");
+    }
+    delay(3000);
+    return;
+  }
+  esp_loader_error_t ferr = ESPFlashBin(NINA_FW_FILENAME);
+  if (ferr != ESP_LOADER_SUCCESS) {
+    Serial.print(F("[wifi] ESPFlashBin failed: "));
+    Serial.println(ferr);
+    if (printLCD) {
+      lcd.setCursor(0, 0); lcd.print("Flash FAIL      ");
+      lcd.setCursor(0, 1); lcd.print("err="); lcd.print(ferr); lcd.print("           ");
+    }
+    delay(3000);
+    return;
+  }
+  // Full success (including MD5 verify).
+  if (printLCD) {
+    lcd.setCursor(0, 0); lcd.print("Reflashed       ");
+    lcd.setCursor(0, 1); lcd.print("Rebooting...    ");
+  }
+  Serial.println(F("[wifi] reflash done; rebooting in 2s"));
+  delay(2000);
+  NVIC_SystemReset();
+#endif
+}
+#endif // WIFI_PROFILE_AIRLIFT
+
 /***********************
  * Connects STA WiFi with retries.
  * @return True when connected and local IP assigned.
@@ -2983,6 +3247,15 @@ void setup() {
   } else {
     Serial.println("card initialized.");  // confirm that it is good to go
   }
+
+#if defined(WIFI_PROFILE_AIRLIFT)
+  // AirLift self-heal: if nina-fw is dead and the SD card has NINAFW.BIN,
+  // burn the efuse strap (if needed) and reflash, then reset. No retry cap;
+  // if the chip is truly unrecoverable the unit boot-loops until the operator
+  // pulls power. AirLift-only; the R4 onboard WiFi (WIFI_PROFILE_R4_WIFI) has
+  // its own firmware update path via the Arduino IDE / fwuploader.
+  checkAndMaybeFlashWiFi();
+#endif
 
 
 
